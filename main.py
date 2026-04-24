@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerFast
-from mlx_lm import load, generate, stream_generate
+from mlx_lm import load, stream_generate
 from mlx_lm.utils import load_model, hf_repo_to_path, snapshot_download
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from config import config
@@ -24,6 +24,13 @@ THINKING_TAG_PAIRS: List[tuple[str, str]] = [
     ("<antThinking>", "</antThinking>"),
     ("<think>", "</think>"),
 ]
+
+THINKING_SYSTEM_INSTRUCTION = (
+    "\n\nIMPORTANT: When you think or reason internally before responding, "
+    "you MUST wrap ALL of your internal thinking inside <think>...</think> tags. "
+    "Only content outside <think> tags will be visible to the user. "
+    "Never output your internal reasoning without wrapping it in <think> tags."
+)
 
 # Build a combined regex for one-shot filtering (non-streaming path).
 _THINKING_TAG_PATTERN = re.compile(
@@ -347,6 +354,11 @@ def format_messages_for_llama(
 
     # Add system message if provided
     system_text = extract_system_text(system)
+    if config.INJECT_THINKING_PROMPT:
+        if system_text:
+            system_text += THINKING_SYSTEM_INSTRUCTION
+        else:
+            system_text = THINKING_SYSTEM_INSTRUCTION.strip()
     if system_text:
         formatted_messages.append({"role": "system", "content": system_text})
 
@@ -467,25 +479,30 @@ async def count_tokens_endpoint(request: TokenCountRequest):
 
 async def generate_response(request: MessagesRequest, prompt: str, input_tokens: int):
     """Generate non-streaming response"""
-    raw_response_text = generate(
+    # Use stream_generate directly so we can read finish_reason from the
+    # last response object (the high-level generate() only returns text).
+    raw_response_text = ""
+    finish_reason = None
+    for response in stream_generate(
         model,
         tokenizer,
         prompt=prompt,
         max_tokens=request.max_tokens,
-        verbose=config.VERBOSE,
-    )
+    ):
+        raw_response_text += response.text
+        finish_reason = response.finish_reason
 
     if config.VERBOSE:
         print(f"DEBUG: Raw response (before filter): {repr(raw_response_text[:500])}")
 
-    raw_output_tokens = count_tokens(raw_response_text)
     response_text = filter_thinking_text(raw_response_text).strip()
 
     if config.VERBOSE:
         print(f"DEBUG: Filtered response: {repr(response_text[:500])}")
+        print(f"DEBUG: finish_reason={finish_reason}")
 
     output_tokens = count_tokens(response_text)
-    stop_reason = "max_tokens" if raw_output_tokens >= request.max_tokens else "end_turn"
+    stop_reason = "max_tokens" if finish_reason == "length" else "end_turn"
 
     response = MessageResponse(
         id="msg_" + str(abs(hash(prompt)))[:8],
@@ -531,15 +548,18 @@ async def stream_generate_response(
     }
     yield f"event: content_block_start\ndata: {json.dumps(content_start)}\n\n"
 
-    # Stream generation
-    generated_token_count = 0
+    # Stream generation — track the last response's finish_reason which
+    # mlx-lm sets to "stop" (EOS) or "length" (max_tokens reached).
+    finish_reason = None
     for response in stream_generate(
         model,
         tokenizer,
         prompt=prompt,
         max_tokens=request.max_tokens,
     ):
-        generated_token_count += 1
+        finish_reason = response.finish_reason
+        if config.VERBOSE:
+            print(f"DEBUG chunk: {repr(response.text)}", flush=True)
         filtered_text = thinking_filter.filter_chunk(response.text)
 
         if filtered_text:
@@ -567,10 +587,15 @@ async def stream_generate_response(
     # Count output tokens from the visible (filtered) text for usage reporting.
     output_tokens = count_tokens(full_text)
 
-    # Determine stop reason from the raw token count (before filtering).
-    # If the model generated as many tokens as max_tokens, the response was
-    # truncated. Claude Code uses this to decide whether to send a follow-up.
-    stop_reason = "max_tokens" if generated_token_count >= request.max_tokens else "end_turn"
+    # Map mlx-lm finish_reason to Anthropic stop_reason.
+    # "length" means max_tokens was hit; anything else means natural end.
+    stop_reason = "max_tokens" if finish_reason == "length" else "end_turn"
+    if config.VERBOSE:
+        print(
+            f"DEBUG: finish_reason={finish_reason} → stop_reason={stop_reason}, "
+            f"output_tokens={output_tokens}",
+            flush=True,
+        )
 
     # Send content block stop
     content_stop = {"type": "content_block_stop", "index": 0}

@@ -25,6 +25,14 @@ class Config:
     # API settings
     API_MODEL_NAME: str = os.getenv("API_MODEL_NAME", "claude-4-sonnet-20250514")
 
+    # Inject a system-prompt instruction that asks the model to wrap its
+    # internal reasoning inside <think>...</think> tags so the proxy can
+    # strip them.  Disable if the model already emits thinking tags natively
+    # (e.g. Qwen3) or if you don't want the overhead.
+    INJECT_THINKING_PROMPT: bool = (
+        os.getenv("INJECT_THINKING_PROMPT", "true").lower() == "true"
+    )
+
     # Logging
     VERBOSE: bool = os.getenv("VERBOSE", "false").lower() == "true"
 
