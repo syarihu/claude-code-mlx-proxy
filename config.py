@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from typing import Optional
+from typing import List, Optional
 
 load_dotenv()
 
@@ -25,13 +25,25 @@ class Config:
     # API settings
     API_MODEL_NAME: str = os.getenv("API_MODEL_NAME", "claude-4-sonnet-20250514")
 
-    # Inject a system-prompt instruction that asks the model to wrap its
-    # internal reasoning inside <think>...</think> tags so the proxy can
-    # strip them.  Disable if the model already emits thinking tags natively
-    # (e.g. Qwen3) or if you don't want the overhead.
+    # Inject a system-prompt instruction asking the model to use <think>
+    # tags.  Set to false for models that natively emit <think> (e.g. Qwen3).
     INJECT_THINKING_PROMPT: bool = (
         os.getenv("INJECT_THINKING_PROMPT", "true").lower() == "true"
     )
+
+    # Tool handling — reduce prompt size by stripping detailed JSON schemas
+    # from tool definitions.  "full" keeps everything, "slim" sends only
+    # name + description + required param names, "none" omits tools entirely.
+    TOOL_MODE: str = os.getenv("TOOL_MODE", "slim")
+
+    # Extra stop sequences (comma-separated).  Generation stops when any of
+    # these appear in the raw model output.  Useful when the model's EOS
+    # token doesn't fire (e.g. GLM-4's <|end|> isn't in eos_token_ids).
+    STOP_SEQUENCES: List[str] = [
+        s
+        for s in os.getenv("STOP_SEQUENCES", "<|user|>,<|end|>,<|im_start|>").split(",")
+        if s
+    ]
 
     # Logging
     VERBOSE: bool = os.getenv("VERBOSE", "false").lower() == "true"

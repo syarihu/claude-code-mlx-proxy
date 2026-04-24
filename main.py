@@ -1,5 +1,6 @@
 import json
 import re
+import uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union, Literal
 from contextlib import asynccontextmanager
@@ -14,16 +15,29 @@ from mlx_lm.utils import load_model, hf_repo_to_path, snapshot_download
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from config import config
 
-# Global variables for model and tokenizer
+# ---------------------------------------------------------------------------
+# Global state (set during model loading)
+# ---------------------------------------------------------------------------
 model = None
 tokenizer = None
+tool_call_start_tag: Optional[str] = None
+tool_call_end_tag: Optional[str] = None
+tool_parser_fn = None
 
-# Thinking tag pairs used by different models / system prompts.
-# Each entry is (open_tag, close_tag).
+# ---------------------------------------------------------------------------
+# Thinking tag definitions
+# ---------------------------------------------------------------------------
 THINKING_TAG_PAIRS: List[tuple[str, str]] = [
     ("<antThinking>", "</antThinking>"),
     ("<think>", "</think>"),
 ]
+
+_THINKING_PATTERN = re.compile(
+    "|".join(
+        re.escape(o) + ".*?" + re.escape(c) for o, c in THINKING_TAG_PAIRS
+    ),
+    re.DOTALL,
+)
 
 THINKING_SYSTEM_INSTRUCTION = (
     "\n\nIMPORTANT: When you think or reason internally before responding, "
@@ -32,119 +46,183 @@ THINKING_SYSTEM_INSTRUCTION = (
     "Never output your internal reasoning without wrapping it in <think> tags."
 )
 
-# Build a combined regex for one-shot filtering (non-streaming path).
-_THINKING_TAG_PATTERN = re.compile(
-    "|".join(
-        re.escape(open_t) + ".*?" + re.escape(close_t)
-        for open_t, close_t in THINKING_TAG_PAIRS
-    ),
-    re.DOTALL,
-)
+# ---------------------------------------------------------------------------
+# Streaming output parser — filters thinking, extracts tool calls
+# ---------------------------------------------------------------------------
 
 
-class ThinkingFilter:
-    """Stateful filter that strips thinking blocks from a stream of text
-    chunks.  Supports multiple tag formats (e.g. <think>..</think>,
-    <antThinking>..</antThinking>).  Tracks whether we are inside a
-    thinking block so partial tokens at chunk boundaries are handled
-    correctly."""
+class OutputParser:
+    """Stateful streaming parser.
 
-    def __init__(self):
-        self._inside_thinking = False
-        self._open_tag = ""
-        self._close_tag = ""
-        self._buffer = ""
+    Processes token-by-token chunks and emits events:
+      ("text", str)       – visible text to stream to the client
+      ("tool_call", dict) – a complete parsed tool call
+    """
 
-    def filter_chunk(self, text: str) -> str:
-        """Return the portion of *text* that is NOT inside a thinking block."""
-        self._buffer += text
-
-        if self._inside_thinking:
-            end = self._buffer.find(self._close_tag)
-            if end == -1:
-                return ""
-            self._buffer = self._buffer[end + len(self._close_tag):]
-            self._inside_thinking = False
-            self._open_tag = ""
-            self._close_tag = ""
-            # After exiting, continue to drain any remaining content.
+    def __init__(self, start_in_thinking: bool = False):
+        if start_in_thinking:
+            self._state = "thinking"
+            self._close_tag = "</think>"
         else:
-            return self._drain_non_thinking()
+            self._state = "normal"
+            self._close_tag = ""
+        self._buffer = ""
+        self._tool_buffer = ""
 
-        return self._drain_non_thinking()
+    # -- public API --
 
-    def _drain_non_thinking(self) -> str:
-        """Extract all non-thinking content from the buffer."""
-        parts: List[str] = []
-        buf = self._buffer
+    def feed(self, chunk: str) -> List[tuple]:
+        events: List[tuple] = []
+        self._buffer += chunk
+        self._drain(events)
+        return events
 
+    def finish(self) -> List[tuple]:
+        events: List[tuple] = []
+        if self._state == "tool_call":
+            parsed = _try_parse_tool(self._tool_buffer + self._buffer)
+            if parsed:
+                for tc in (parsed if isinstance(parsed, list) else [parsed]):
+                    events.append(("tool_call", tc))
+        elif self._state == "normal" and self._buffer:
+            events.append(("text", self._buffer))
+        self._buffer = ""
+        self._tool_buffer = ""
+        self._state = "normal"
+        return events
+
+    # -- internals --
+
+    def _drain(self, events: List[tuple]):
         while True:
-            # Find the earliest opening tag among all known pairs.
-            earliest_pos = len(buf)
+            if self._state == "thinking":
+                idx = self._buffer.find(self._close_tag)
+                if idx == -1:
+                    self._buffer = ""
+                    return
+                self._buffer = self._buffer[idx + len(self._close_tag) :]
+                self._state = "normal"
+                self._close_tag = ""
+                continue
+
+            if self._state == "tool_call":
+                if not tool_call_end_tag:
+                    self._tool_buffer += self._buffer
+                    self._buffer = ""
+                    return
+                idx = self._buffer.find(tool_call_end_tag)
+                if idx == -1:
+                    self._tool_buffer += self._buffer
+                    self._buffer = ""
+                    return
+                self._tool_buffer += self._buffer[:idx]
+                self._buffer = self._buffer[idx + len(tool_call_end_tag) :]
+                self._state = "normal"
+                parsed = _try_parse_tool(self._tool_buffer)
+                if parsed:
+                    for tc in (parsed if isinstance(parsed, list) else [parsed]):
+                        events.append(("tool_call", tc))
+                self._tool_buffer = ""
+                continue
+
+            # --- normal state ---
+            earliest_pos = len(self._buffer)
             earliest_open = ""
             earliest_close = ""
+            earliest_type = ""
+
             for open_t, close_t in THINKING_TAG_PAIRS:
-                pos = buf.find(open_t)
+                pos = self._buffer.find(open_t)
                 if pos != -1 and pos < earliest_pos:
                     earliest_pos = pos
                     earliest_open = open_t
                     earliest_close = close_t
+                    earliest_type = "thinking"
 
-            if earliest_pos == len(buf):
-                # No complete opening tag found.  Hold back a trailing
-                # partial prefix (e.g. "<antThink" without "ing>") so we
-                # don't emit it before the next chunk completes the tag.
-                # Only check the END of the buffer — a prefix appearing in
-                # the middle is clearly not a partial tag.
-                safe_end = len(buf)
-                for open_t, _ in THINKING_TAG_PAIRS:
-                    for plen in range(1, len(open_t)):
-                        prefix = open_t[:plen]
-                        if buf.endswith(prefix):
-                            safe_end = min(safe_end, len(buf) - plen)
-                            break
-                if safe_end < len(buf):
-                    parts.append(buf[:safe_end])
-                    self._buffer = buf[safe_end:]
-                else:
-                    parts.append(buf)
-                    self._buffer = ""
-                break
+            if tool_call_start_tag:
+                pos = self._buffer.find(tool_call_start_tag)
+                if pos != -1 and pos < earliest_pos:
+                    earliest_pos = pos
+                    earliest_open = tool_call_start_tag
+                    earliest_close = tool_call_end_tag
+                    earliest_type = "tool_call"
 
-            parts.append(buf[:earliest_pos])
-            buf = buf[earliest_pos + len(earliest_open):]
+            if earliest_pos == len(self._buffer):
+                safe = self._safe_end()
+                if safe > 0:
+                    events.append(("text", self._buffer[:safe]))
+                self._buffer = self._buffer[safe:]
+                return
 
-            end = buf.find(earliest_close)
-            if end == -1:
-                # Unclosed tag — enter thinking mode
-                self._inside_thinking = True
-                self._open_tag = earliest_open
+            if earliest_pos > 0:
+                events.append(("text", self._buffer[:earliest_pos]))
+
+            self._buffer = self._buffer[earliest_pos + len(earliest_open) :]
+
+            if earliest_type == "thinking":
+                self._state = "thinking"
                 self._close_tag = earliest_close
-                self._buffer = ""
-                break
+            elif earliest_type == "tool_call":
+                self._state = "tool_call"
+                self._tool_buffer = ""
 
-            buf = buf[end + len(earliest_close):]
-
-        return "".join(parts)
-
-    def filter_remaining(self) -> str:
-        """Drain any remaining buffered text (called at end of stream)."""
-        if self._inside_thinking:
-            # If we're still inside a thinking block, discard it.
-            self._inside_thinking = False
-            self._open_tag = ""
-            self._close_tag = ""
-        output = self._buffer
-        self._buffer = ""
-        return output
-
-
-def filter_thinking_text(text: str) -> str:
-    """One-shot filter: remove all thinking blocks."""
-    return _THINKING_TAG_PATTERN.sub("", text)
+    def _safe_end(self) -> int:
+        buf = self._buffer
+        safe = len(buf)
+        all_tags = [t for t, _ in THINKING_TAG_PAIRS]
+        if tool_call_start_tag:
+            all_tags.append(tool_call_start_tag)
+        for tag in all_tags:
+            for plen in range(1, len(tag)):
+                if buf.endswith(tag[:plen]):
+                    safe = min(safe, len(buf) - plen)
+                    break
+        return safe
 
 
-# Content block models
+def _try_parse_tool(text: str):
+    if tool_parser_fn is None:
+        return None
+    try:
+        return tool_parser_fn(text.strip(), None)
+    except Exception as e:
+        if config.VERBOSE:
+            print(f"Warning: tool call parse failed: {e}")
+        return None
+
+
+def parse_complete_output(raw_text: str) -> tuple[str, list[dict]]:
+    """One-shot parse for non-streaming: returns (visible_text, tool_calls)."""
+    text = _THINKING_PATTERN.sub("", raw_text)
+
+    tool_calls: list[dict] = []
+    if tool_call_start_tag and tool_call_end_tag and tool_parser_fn:
+        tc_pattern = re.compile(
+            re.escape(tool_call_start_tag)
+            + "(.*?)"
+            + re.escape(tool_call_end_tag),
+            re.DOTALL,
+        )
+        for m in tc_pattern.finditer(text):
+            try:
+                parsed = tool_parser_fn(m.group(1), None)
+                if parsed:
+                    if isinstance(parsed, list):
+                        tool_calls.extend(parsed)
+                    else:
+                        tool_calls.append(parsed)
+            except Exception:
+                pass
+        text = tc_pattern.sub("", text)
+
+    return text.strip(), tool_calls
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models (Anthropic Messages API)
+# ---------------------------------------------------------------------------
+
+
 class ContentBlockText(BaseModel):
     type: Literal["text"] = "text"
     text: str
@@ -235,124 +313,170 @@ class MessageResponse(BaseModel):
     id: str
     type: str = "message"
     role: str = "assistant"
-    content: List[ContentBlockText]
+    content: List[Union[ContentBlockText, ContentBlockToolUse]]
     model: str
     stop_reason: str = "end_turn"
     stop_sequence: Optional[str] = None
     usage: Usage
 
 
-class MessageStreamResponse(BaseModel):
-    type: str
-    index: Optional[int] = None
-    delta: Optional[Dict[str, Any]] = None
-    usage: Optional[Usage] = None
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
 
 
 def _load_model_with_fallback(model_name: str, tokenizer_config: dict):
-    """Load model and tokenizer, falling back to PreTrainedTokenizerFast when
-    the model's tokenizer uses the Transformers v5 TokenizersBackend class which
-    is not available in older Transformers installations.
-    """
     try:
         return load(model_name, tokenizer_config=tokenizer_config)
     except ValueError as e:
         if "TokenizersBackend" not in str(e):
             raise
         print(
-            "Warning: Failed to load tokenizer via AutoTokenizer (TokenizersBackend not "
-            "found). This typically means the model was saved with Transformers v5 but an "
-            "older version is installed. Upgrading to 'transformers>=5.0.0' is recommended. "
-            "Attempting fallback using PreTrainedTokenizerFast..."
+            "Warning: Failed to load tokenizer via AutoTokenizer "
+            "(TokenizersBackend not found). Attempting fallback using "
+            "PreTrainedTokenizerFast..."
         )
 
-    # Use cached model files (downloaded by the failed load() call above, or already
-    # present from a previous run).
     model_path = Path(hf_repo_to_path(model_name))
     if not model_path.exists():
         model_path = Path(snapshot_download(model_name))
     mlx_model, mlx_config = load_model(model_path)
 
-    # PreTrainedTokenizerFast.from_pretrained does not do the tokenizer-class
-    # name lookup that AutoTokenizer performs, so it avoids the TokenizersBackend
-    # error while still reading tokenizer.json correctly.
     hf_tokenizer = PreTrainedTokenizerFast.from_pretrained(
         str(model_path), **tokenizer_config
     )
     eos_token_id = mlx_config.get("eos_token_id")
-    tokenizer = TokenizerWrapper(hf_tokenizer, eos_token_ids=eos_token_id)
-
-    return mlx_model, tokenizer
+    wrapped = TokenizerWrapper(hf_tokenizer, eos_token_ids=eos_token_id)
+    return mlx_model, wrapped
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load model on startup
-    global model, tokenizer
+    global model, tokenizer, tool_call_start_tag, tool_call_end_tag, tool_parser_fn
     print(f"Loading MLX model: {config.MODEL_NAME}")
 
-    # Prepare tokenizer config
-    tokenizer_config = {}
+    tokenizer_config: dict = {}
     if config.TRUST_REMOTE_CODE:
         tokenizer_config["trust_remote_code"] = True
     if config.EOS_TOKEN:
         tokenizer_config["eos_token"] = config.EOS_TOKEN
 
     model, tokenizer = _load_model_with_fallback(config.MODEL_NAME, tokenizer_config)
+
+    if getattr(tokenizer, "has_tool_calling", False):
+        tool_call_start_tag = getattr(tokenizer, "_tool_call_start", None)
+        tool_call_end_tag = getattr(tokenizer, "_tool_call_end", None)
+        tool_parser_fn = getattr(tokenizer, "tool_parser", None)
+        print(
+            f"Tool calling enabled — "
+            f"start={tool_call_start_tag!r}  end={tool_call_end_tag!r}"
+        )
+    else:
+        print("Tool calling not detected for this model")
+
+    # Register stop sequences as EOS tokens so mlx-lm stops generation
+    # BEFORE the token is yielded.  This prevents partial stop-sequence
+    # text from leaking into the output.
+    original_eos = set(tokenizer.eos_token_ids or [])
+    added_eos: list[str] = []
+    for seq in config.STOP_SEQUENCES:
+        try:
+            ids = tokenizer.encode(seq, add_special_tokens=False)
+            if len(ids) == 1 and ids[0] not in original_eos:
+                original_eos.add(ids[0])
+                added_eos.append(f"{seq!r}→{ids[0]}")
+        except Exception:
+            pass
+    if added_eos:
+        tokenizer.eos_token_ids = list(original_eos)
+        print(f"Added stop-sequence EOS tokens: {', '.join(added_eos)}")
+    print(f"EOS token IDs: {tokenizer.eos_token_ids}")
+
     print("Model loaded successfully!")
     yield
-    # Cleanup on shutdown
     print("Shutting down...")
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-def extract_text_from_content(
-    content: Union[
-        str,
-        List[
-            Union[
-                ContentBlockText,
-                ContentBlockImage,
-                ContentBlockToolUse,
-                ContentBlockToolResult,
-            ]
-        ],
-    ],
-) -> str:
-    """Extract text content from Claude-style content blocks"""
-    if isinstance(content, str):
-        return content
-
-    text_parts = []
-    for block in content:
-        if hasattr(block, "type") and block.type == "text":
-            text_parts.append(block.text)
-        elif isinstance(block, dict) and block.get("type") == "text":
-            text_parts.append(block.get("text", ""))
-
-    return " ".join(text_parts)
+# ---------------------------------------------------------------------------
+# Format conversion: Anthropic ↔ OpenAI / chat-template
+# ---------------------------------------------------------------------------
 
 
 def extract_system_text(
     system: Optional[Union[str, List[SystemContent]]],
 ) -> Optional[str]:
-    """Extract system text from system parameter"""
     if isinstance(system, str):
         return system
-    elif isinstance(system, list):
-        return " ".join([content.text for content in system])
+    if isinstance(system, list):
+        return " ".join(c.text for c in system)
     return None
 
 
-def format_messages_for_llama(
-    messages: List[Message], system: Optional[Union[str, List[SystemContent]]] = None
-) -> str:
-    """Convert Claude-style messages to Llama format"""
-    formatted_messages = []
+def anthropic_tools_to_openai(tools: List[Tool]) -> List[dict]:
+    result = []
+    for t in tools:
+        if config.TOOL_MODE == "slim":
+            props = t.input_schema.get("properties", {})
+            required = t.input_schema.get("required", [])
+            slim_params: Dict[str, Any] = {
+                "type": "object",
+                "properties": {
+                    k: {"type": v.get("type", "string")}
+                    for k, v in props.items()
+                },
+            }
+            if required:
+                slim_params["required"] = required
+            result.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": (t.description or "")[:200],
+                        "parameters": slim_params,
+                    },
+                }
+            )
+        else:
+            result.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description or "",
+                        "parameters": t.input_schema,
+                    },
+                }
+            )
+    return result
 
-    # Add system message if provided
+
+def _tool_result_to_str(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    if isinstance(content, dict) and content.get("type") == "text":
+        return content.get("text", "")
+    return str(content) if content else ""
+
+
+def anthropic_messages_to_chat(
+    messages: List[Message],
+    system: Optional[Union[str, List[SystemContent]]] = None,
+) -> List[dict]:
+    """Convert Anthropic-format messages to OpenAI-style chat messages."""
+    result: List[dict] = []
+
     system_text = extract_system_text(system)
     if config.INJECT_THINKING_PROMPT:
         if system_text:
@@ -360,101 +484,230 @@ def format_messages_for_llama(
         else:
             system_text = THINKING_SYSTEM_INSTRUCTION.strip()
     if system_text:
-        formatted_messages.append({"role": "system", "content": system_text})
+        result.append({"role": "system", "content": system_text})
 
-    # Add user messages
-    for message in messages:
-        content_text = extract_text_from_content(message.content)
-        formatted_messages.append({"role": message.role, "content": content_text})
+    for msg in messages:
+        if isinstance(msg.content, str):
+            result.append({"role": msg.role, "content": msg.content})
+            continue
 
-    # Apply chat template if available
+        if msg.role == "assistant":
+            text_parts: List[str] = []
+            tc_list: List[dict] = []
+            for block in msg.content:
+                btype = getattr(block, "type", None)
+                if btype == "text":
+                    text_parts.append(block.text)
+                elif btype == "tool_use":
+                    tc_list.append(
+                        {
+                            "id": block.id,
+                            "type": "function",
+                            "function": {
+                                "name": block.name,
+                                "arguments": (
+                                    block.input
+                                    if isinstance(block.input, dict)
+                                    else {}
+                                ),
+                            },
+                        }
+                    )
+            entry: dict = {"role": "assistant"}
+            text = "\n".join(text_parts) if text_parts else None
+            if text:
+                entry["content"] = text
+            if tc_list:
+                entry["tool_calls"] = tc_list
+            if not text and not tc_list:
+                entry["content"] = ""
+            result.append(entry)
+
+        elif msg.role == "user":
+            text_parts = []
+            tool_results: List[dict] = []
+            for block in msg.content:
+                btype = getattr(block, "type", None)
+                if btype == "text":
+                    text_parts.append(block.text)
+                elif btype == "tool_result":
+                    tool_results.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": block.tool_use_id,
+                            "content": _tool_result_to_str(block.content),
+                        }
+                    )
+            for tr in tool_results:
+                result.append(tr)
+            if text_parts:
+                result.append({"role": "user", "content": "\n".join(text_parts)})
+
+    return result
+
+
+def _strip_tool_fields(chat_messages: List[dict]) -> List[dict]:
+    """Remove tool_calls / role:'tool' so the template works without tools=."""
+    cleaned: List[dict] = []
+    for msg in chat_messages:
+        if msg["role"] == "tool":
+            name_hint = msg.get("name", "")
+            content = msg.get("content", "")
+            label = f"[Tool result{': ' + name_hint if name_hint else ''}] " if name_hint else "[Tool result] "
+            cleaned.append({"role": "user", "content": label + content})
+            continue
+        if "tool_calls" in msg:
+            new_msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+            parts: List[str] = []
+            if new_msg.get("content"):
+                parts.append(new_msg["content"])
+            for tc in msg["tool_calls"]:
+                fn = tc.get("function", {})
+                parts.append(f"[Calling tool: {fn.get('name', '?')}({fn.get('arguments', '')})]")
+            new_msg["content"] = "\n".join(parts) if parts else ""
+            cleaned.append(new_msg)
+            continue
+        cleaned.append(msg)
+    return cleaned
+
+
+def format_prompt(
+    messages: List[Message],
+    system: Optional[Union[str, List[SystemContent]]] = None,
+    tools: Optional[List[Tool]] = None,
+) -> str:
+    """Build prompt string using the model's chat template."""
+    chat_messages = anthropic_messages_to_chat(messages, system)
+    if config.TOOL_MODE == "none":
+        openai_tools = None
+    else:
+        openai_tools = anthropic_tools_to_openai(tools) if tools else None
+
     if tokenizer.chat_template is not None:
+        # Try with tools first
+        if openai_tools:
+            try:
+                result = tokenizer.apply_chat_template(
+                    chat_messages,
+                    tools=openai_tools,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                if isinstance(result, str):
+                    if config.VERBOSE:
+                        print(f"DEBUG prompt (last 500): ...{result[-500:]}")
+                    return result
+            except Exception as e:
+                print(f"Warning: chat template failed WITH tools: {e}")
+                print("Retrying without tools...")
+
+        # Try without tools — strip tool_calls/role:tool so template won't choke
+        plain_messages = _strip_tool_fields(chat_messages)
         try:
             result = tokenizer.apply_chat_template(
-                formatted_messages, add_generation_prompt=True, tokenize=False
+                plain_messages,
+                add_generation_prompt=True,
+                tokenize=False,
             )
-            # Ensure we return a string, not tokens
             if isinstance(result, str):
+                if openai_tools:
+                    print(
+                        f"Warning: tools excluded from prompt "
+                        f"({len(openai_tools)} tools dropped)"
+                    )
+                if config.VERBOSE:
+                    print(f"DEBUG prompt (last 500): ...{result[-500:]}")
                 return result
-        except Exception:
-            # Fall through to manual formatting if template fails
-            pass
+        except Exception as e:
+            print(f"ERROR: chat template failed completely: {e}")
 
-    # Fallback formatting (used if no template or template fails)
+    # Last-resort fallback — should rarely be reached
+    print("Warning: using generic fallback prompt format")
     prompt = ""
-    for msg in formatted_messages:
-        if msg["role"] == "system":
-            prompt += f"<|system|>\n{msg['content']}\n<|end|>\n"
-        elif msg["role"] == "user":
-            prompt += f"<|user|>\n{msg['content']}\n<|end|>\n"
-        elif msg["role"] == "assistant":
-            prompt += f"<|assistant|>\n{msg['content']}\n<|end|>\n"
+    for msg in chat_messages:
+        role = msg["role"]
+        content = msg.get("content", "")
+        prompt += f"<|{role}|>\n{content}\n<|end|>\n"
     prompt += "<|assistant|>\n"
     return prompt
 
 
+# ---------------------------------------------------------------------------
+# Token counting
+# ---------------------------------------------------------------------------
+
+
 def count_tokens(text: str) -> int:
-    """Count tokens in text"""
     try:
-        # MLX tokenizers often expect the text to be handled through their specific methods
-        # First try the standard approach with proper string handling
         if isinstance(text, str) and text.strip():
-            # For MLX, we may need to use a different approach
-            # Try to get tokens using the tokenizer's __call__ method or encode
             try:
-                # Some MLX tokenizers work better with this approach
-                result = tokenizer(text, return_tensors=False, add_special_tokens=False)
+                result = tokenizer(
+                    text, return_tensors=False, add_special_tokens=False
+                )
                 if isinstance(result, dict) and "input_ids" in result:
                     return len(result["input_ids"])
-                elif hasattr(result, "__len__"):
+                if hasattr(result, "__len__"):
                     return len(result)
             except (AttributeError, TypeError, ValueError):
                 pass
-
-            # Try direct encode without parameters
             try:
                 encoded = tokenizer.encode(text)
-                return (
-                    len(encoded) if hasattr(encoded, "__len__") else len(list(encoded))
-                )
+                return len(encoded) if hasattr(encoded, "__len__") else len(list(encoded))
             except (AttributeError, TypeError, ValueError):
                 pass
+        return max(1, len(str(text)) // 4)
+    except Exception:
+        return max(1, len(str(text)) // 4)
 
-            # Try with explicit string conversion and basic parameters
-            try:
-                tokens = tokenizer.encode(str(text), add_special_tokens=False)
-                return len(tokens)
-            except (AttributeError, TypeError, ValueError):
-                pass
 
-        # Final fallback: character-based estimation
-        return max(1, len(str(text)) // 4)  # At least 1 token, ~4 chars per token
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    except Exception as e:
-        print(f"Token counting failed with error: {e}")
-        return max(1, len(str(text)) // 4)  # Fallback estimation
+
+def _prompt_starts_in_thinking(prompt: str) -> bool:
+    """Check if the prompt's generation starts inside a <think> block."""
+    return prompt.rstrip().endswith("<think>")
+
+
+def _make_tool_use_id() -> str:
+    return "toolu_" + uuid.uuid4().hex[:24]
+
+
+def _make_msg_id(prompt: str) -> str:
+    return "msg_" + uuid.uuid4().hex[:8]
+
+
+# ---------------------------------------------------------------------------
+# API endpoints
+# ---------------------------------------------------------------------------
 
 
 @app.post("/v1/messages")
 async def create_message(request: MessagesRequest):
     if model is None or tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-
     try:
-        # Format messages for Llama
-        prompt = format_messages_for_llama(request.messages, request.system)
-
-        # Count input tokens
+        prompt = format_prompt(request.messages, request.system, request.tools)
         input_tokens = count_tokens(prompt)
+        starts_thinking = _prompt_starts_in_thinking(prompt)
+        n_tools = len(request.tools) if request.tools else 0
+        print(
+            f"[/v1/messages] input_tokens={input_tokens}, tools={n_tools}, "
+            f"tool_mode={config.TOOL_MODE}, stream={request.stream}, "
+            f"starts_thinking={starts_thinking}"
+        )
 
         if request.stream:
             return StreamingResponse(
-                stream_generate_response(request, prompt, input_tokens),
+                stream_generate_response(
+                    request, prompt, input_tokens, starts_thinking
+                ),
                 media_type="text/event-stream",
             )
-        else:
-            return await generate_response(request, prompt, input_tokens)
-
+        return await generate_response(
+            request, prompt, input_tokens, starts_thinking
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -463,133 +716,235 @@ async def create_message(request: MessagesRequest):
 async def count_tokens_endpoint(request: TokenCountRequest):
     if tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-
     try:
-        # Format messages for token counting
-        prompt = format_messages_for_llama(request.messages, request.system)
-
-        # Count tokens
-        token_count = count_tokens(prompt)
-
-        return {"input_tokens": token_count}
-
+        prompt = format_prompt(request.messages, request.system, request.tools)
+        return {"input_tokens": count_tokens(prompt)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def generate_response(request: MessagesRequest, prompt: str, input_tokens: int):
-    """Generate non-streaming response"""
-    # Use stream_generate directly so we can read finish_reason from the
-    # last response object (the high-level generate() only returns text).
-    raw_response_text = ""
+# ---------------------------------------------------------------------------
+# Non-streaming response
+# ---------------------------------------------------------------------------
+
+
+async def generate_response(
+    request: MessagesRequest,
+    prompt: str,
+    input_tokens: int,
+    starts_thinking: bool = False,
+):
+    raw_text = ""
     finish_reason = None
-    for response in stream_generate(
-        model,
-        tokenizer,
-        prompt=prompt,
-        max_tokens=request.max_tokens,
+    for resp in stream_generate(
+        model, tokenizer, prompt=prompt, max_tokens=request.max_tokens
     ):
-        raw_response_text += response.text
-        finish_reason = response.finish_reason
+        raw_text += resp.text
+        finish_reason = resp.finish_reason
+        hit_stop = False
+        for seq in config.STOP_SEQUENCES:
+            pos = raw_text.find(seq)
+            if pos != -1:
+                raw_text = raw_text[:pos]
+                hit_stop = True
+                break
+        if hit_stop:
+            break
+
+    if starts_thinking:
+        raw_text = "<think>" + raw_text
 
     if config.VERBOSE:
-        print(f"DEBUG: Raw response (before filter): {repr(raw_response_text[:500])}")
+        print(f"DEBUG raw (first 500): {repr(raw_text[:500])}")
 
-    response_text = filter_thinking_text(raw_response_text).strip()
+    visible_text, tool_calls = parse_complete_output(raw_text)
 
     if config.VERBOSE:
-        print(f"DEBUG: Filtered response: {repr(response_text[:500])}")
-        print(f"DEBUG: finish_reason={finish_reason}")
+        print(f"DEBUG visible: {repr(visible_text[:300])}")
+        print(f"DEBUG tool_calls: {tool_calls}")
+        print(f"DEBUG finish_reason={finish_reason}")
 
-    output_tokens = count_tokens(response_text)
-    stop_reason = "max_tokens" if finish_reason == "length" else "end_turn"
+    content: List[Union[ContentBlockText, ContentBlockToolUse]] = []
+    if visible_text:
+        content.append(ContentBlockText(text=visible_text))
+    for tc in tool_calls:
+        content.append(
+            ContentBlockToolUse(
+                id=_make_tool_use_id(),
+                name=tc["name"],
+                input=tc.get("arguments", {}),
+            )
+        )
+    if not content:
+        content.append(ContentBlockText(text=""))
 
-    response = MessageResponse(
-        id="msg_" + str(abs(hash(prompt)))[:8],
-        content=[ContentBlockText(text=response_text)],
+    if tool_calls:
+        stop_reason = "tool_use"
+    elif finish_reason == "length":
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
+
+    output_tokens = count_tokens(raw_text)
+
+    return MessageResponse(
+        id=_make_msg_id(prompt),
+        content=content,
         model=request.model,
         stop_reason=stop_reason,
         usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
     )
 
-    return response
+
+# ---------------------------------------------------------------------------
+# Streaming response
+# ---------------------------------------------------------------------------
 
 
 async def stream_generate_response(
-    request: MessagesRequest, prompt: str, input_tokens: int
+    request: MessagesRequest,
+    prompt: str,
+    input_tokens: int,
+    starts_thinking: bool = False,
 ):
-    """Generate streaming response"""
-    response_id = "msg_" + str(abs(hash(prompt)))[:8]
+    response_id = _make_msg_id(prompt)
+    parser = OutputParser(start_in_thinking=starts_thinking)
     full_text = ""
+    has_tool_calls = False
 
-    thinking_filter = ThinkingFilter()
-
-    # Send message start event
-    message_start = {
-        "type": "message_start",
-        "message": {
-            "id": response_id,
-            "type": "message",
-            "role": "assistant",
-            "content": [],
-            "model": request.model,
-            "stop_reason": None,
-            "stop_sequence": None,
-            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+    # --- message_start ---
+    yield _sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": response_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": request.model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            },
         },
-    }
-    yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+    )
 
-    # Send content block start
-    content_start = {
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {"type": "text", "text": ""},
-    }
-    yield f"event: content_block_start\ndata: {json.dumps(content_start)}\n\n"
+    block_index = 0
+    text_block_open = False
 
-    # Stream generation — track the last response's finish_reason which
-    # mlx-lm sets to "stop" (EOS) or "length" (max_tokens reached).
+    def _ensure_text_block():
+        nonlocal block_index, text_block_open
+        if not text_block_open:
+            text_block_open = True
+            return _sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            )
+        return None
+
+    def _close_text_block():
+        nonlocal block_index, text_block_open
+        if text_block_open:
+            text_block_open = False
+            msg = _sse(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": block_index},
+            )
+            block_index += 1
+            return msg
+        return None
+
+    # --- stream tokens ---
     finish_reason = None
-    for response in stream_generate(
-        model,
-        tokenizer,
-        prompt=prompt,
-        max_tokens=request.max_tokens,
+    raw_tail = ""  # rolling window for stop-sequence detection
+    generation_stopped = False
+    for resp in stream_generate(
+        model, tokenizer, prompt=prompt, max_tokens=request.max_tokens
     ):
-        finish_reason = response.finish_reason
+        finish_reason = resp.finish_reason
         if config.VERBOSE:
-            print(f"DEBUG chunk: {repr(response.text)}", flush=True)
-        filtered_text = thinking_filter.filter_chunk(response.text)
+            print(f"DEBUG chunk: {repr(resp.text)}", flush=True)
 
-        if filtered_text:
-            full_text += filtered_text
+        # Stop-sequence detection on the raw (unfiltered) output.
+        raw_tail += resp.text
+        if len(raw_tail) > 200:
+            raw_tail = raw_tail[-200:]
+        for seq in config.STOP_SEQUENCES:
+            if seq in raw_tail:
+                if config.VERBOSE:
+                    print(f"DEBUG: stop sequence {seq!r} detected, stopping")
+                generation_stopped = True
+                break
+        if generation_stopped:
+            break
 
-            # Send content block delta
-            content_delta = {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "text_delta", "text": filtered_text},
-            }
-            yield f"event: content_block_delta\ndata: {json.dumps(content_delta)}\n\n"
+        for event_type, event_data in parser.feed(resp.text):
+            if event_type == "text":
+                full_text += event_data
+                msg = _ensure_text_block()
+                if msg:
+                    yield msg
+                yield _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "text_delta", "text": event_data},
+                    },
+                )
 
-    # Drain any remaining buffered text
-    remaining = thinking_filter.filter_remaining()
-    if remaining:
-        full_text += remaining
-        content_delta = {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": remaining},
-        }
-        yield f"event: content_block_delta\ndata: {json.dumps(content_delta)}\n\n"
+            elif event_type == "tool_call":
+                has_tool_calls = True
+                msg = _close_text_block()
+                if msg:
+                    yield msg
+                for msg in _emit_tool_use_block(block_index, event_data):
+                    yield msg
+                block_index += 1
 
-    # Count output tokens from the visible (filtered) text for usage reporting.
+    # --- flush remaining ---
+    for event_type, event_data in parser.finish():
+        if event_type == "text":
+            full_text += event_data
+            msg = _ensure_text_block()
+            if msg:
+                yield msg
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": event_data},
+                },
+            )
+        elif event_type == "tool_call":
+            has_tool_calls = True
+            msg = _close_text_block()
+            if msg:
+                yield msg
+            for msg in _emit_tool_use_block(block_index, event_data):
+                yield msg
+            block_index += 1
+
+    # --- close last open block ---
+    msg = _close_text_block()
+    if msg:
+        yield msg
+
+    # --- stop reason ---
+    if has_tool_calls:
+        stop_reason = "tool_use"
+    elif finish_reason == "length":
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
+
     output_tokens = count_tokens(full_text)
-
-    # Map mlx-lm finish_reason to Anthropic stop_reason.
-    # "length" means max_tokens was hit; anything else means natural end.
-    stop_reason = "max_tokens" if finish_reason == "length" else "end_turn"
     if config.VERBOSE:
         print(
             f"DEBUG: finish_reason={finish_reason} → stop_reason={stop_reason}, "
@@ -597,26 +952,63 @@ async def stream_generate_response(
             flush=True,
         )
 
-    # Send content block stop
-    content_stop = {"type": "content_block_stop", "index": 0}
-    yield f"event: content_block_stop\ndata: {json.dumps(content_stop)}\n\n"
+    yield _sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": output_tokens},
+        },
+    )
+    yield _sse("message_stop", {"type": "message_stop"})
 
-    # Send message delta with usage
-    message_delta = {
-        "type": "message_delta",
-        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"output_tokens": output_tokens},
-    }
-    yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
 
-    # Send message stop
-    message_stop = {"type": "message_stop"}
-    yield f"event: message_stop\ndata: {json.dumps(message_stop)}\n\n"
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _emit_tool_use_block(index: int, tc: dict):
+    tool_id = _make_tool_use_id()
+    name = tc.get("name", "unknown")
+    arguments = tc.get("arguments", {})
+
+    yield _sse(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {
+                "type": "tool_use",
+                "id": tool_id,
+                "name": name,
+                "input": {},
+            },
+        },
+    )
+    yield _sse(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json.dumps(arguments),
+            },
+        },
+    )
+    yield _sse(
+        "content_block_stop",
+        {"type": "content_block_stop", "index": index},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Utility endpoints
+# ---------------------------------------------------------------------------
 
 
 @app.get("/v1/models")
 async def list_models():
-    """Return list of available models (Anthropic API compatible)"""
     return {
         "object": "list",
         "data": [
