@@ -1,12 +1,11 @@
 [project]
 name = "claude-code-mlx-proxy"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "Anthropic Messages API proxy for local MLX models via mlx-lm server"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi[standard]>=0.116.1",
-    "huggingface-hub>=0.34.3",
-    "mlx-lm>=0.31.3",
+    "httpx>=0.28.0",
     "python-dotenv>=1.1.1",
 ]
