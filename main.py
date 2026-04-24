@@ -18,20 +18,34 @@ from config import config
 model = None
 tokenizer = None
 
-# Regex patterns for thinking tags (Anthropic uses <antThinking>)
-THINKING_TAG_PATTERN = re.compile(
-    r"<antThinking>.*?</antThinking>", re.DOTALL
+# Thinking tag pairs used by different models / system prompts.
+# Each entry is (open_tag, close_tag).
+THINKING_TAG_PAIRS: List[tuple[str, str]] = [
+    ("<antThinking>", "</antThinking>"),
+    ("<think>", "</think>"),
+]
+
+# Build a combined regex for one-shot filtering (non-streaming path).
+_THINKING_TAG_PATTERN = re.compile(
+    "|".join(
+        re.escape(open_t) + ".*?" + re.escape(close_t)
+        for open_t, close_t in THINKING_TAG_PAIRS
+    ),
+    re.DOTALL,
 )
 
 
 class ThinkingFilter:
-    """Stateful filter that strips <antThinking>...</antThinking> blocks from
-    a stream of text chunks.  Tracks whether we are currently inside a
+    """Stateful filter that strips thinking blocks from a stream of text
+    chunks.  Supports multiple tag formats (e.g. <think>..</think>,
+    <antThinking>..</antThinking>).  Tracks whether we are inside a
     thinking block so partial tokens at chunk boundaries are handled
     correctly."""
 
     def __init__(self):
         self._inside_thinking = False
+        self._open_tag = ""
+        self._close_tag = ""
         self._buffer = ""
 
     def filter_chunk(self, text: str) -> str:
@@ -39,66 +53,88 @@ class ThinkingFilter:
         self._buffer += text
 
         if self._inside_thinking:
-            end = self._buffer.find("</antThinking>")
+            end = self._buffer.find(self._close_tag)
             if end == -1:
                 return ""
-            self._buffer = self._buffer[end + len("</antThinking>"):]
+            self._buffer = self._buffer[end + len(self._close_tag):]
             self._inside_thinking = False
-            # After exiting a thinking block, continue to process the
-            # remainder (which may contain more non-thinking text or
-            # another thinking block).
+            self._open_tag = ""
+            self._close_tag = ""
+            # After exiting, continue to drain any remaining content.
         else:
             return self._drain_non_thinking()
 
         return self._drain_non_thinking()
 
     def _drain_non_thinking(self) -> str:
-        """Extract all non-thinking content from the buffer, stripping
-        any <antThinking>...</antThinking> blocks encountered."""
+        """Extract all non-thinking content from the buffer."""
         parts: List[str] = []
         buf = self._buffer
+
         while True:
-            start = buf.find("<antThinking>")
-            if start == -1:
-                # Check for a partial opening tag at the end of the buffer
-                partial = buf.find("<antThinking")
-                if partial != -1:
-                    # Everything before the partial tag is safe output
-                    parts.append(buf[:partial])
-                    # Keep the partial tag in the buffer
-                    self._buffer = buf[partial:]
+            # Find the earliest opening tag among all known pairs.
+            earliest_pos = len(buf)
+            earliest_open = ""
+            earliest_close = ""
+            for open_t, close_t in THINKING_TAG_PAIRS:
+                pos = buf.find(open_t)
+                if pos != -1 and pos < earliest_pos:
+                    earliest_pos = pos
+                    earliest_open = open_t
+                    earliest_close = close_t
+
+            if earliest_pos == len(buf):
+                # No complete opening tag found.  Hold back a trailing
+                # partial prefix (e.g. "<antThink" without "ing>") so we
+                # don't emit it before the next chunk completes the tag.
+                # Only check the END of the buffer — a prefix appearing in
+                # the middle is clearly not a partial tag.
+                safe_end = len(buf)
+                for open_t, _ in THINKING_TAG_PAIRS:
+                    for plen in range(1, len(open_t)):
+                        prefix = open_t[:plen]
+                        if buf.endswith(prefix):
+                            safe_end = min(safe_end, len(buf) - plen)
+                            break
+                if safe_end < len(buf):
+                    parts.append(buf[:safe_end])
+                    self._buffer = buf[safe_end:]
                 else:
-                    # No thinking tags at all — everything is output
                     parts.append(buf)
                     self._buffer = ""
                 break
 
-            parts.append(buf[:start])
-            buf = buf[start + len("<antThinking>"):]
-            end = buf.find("</antThinking>")
+            parts.append(buf[:earliest_pos])
+            buf = buf[earliest_pos + len(earliest_open):]
+
+            end = buf.find(earliest_close)
             if end == -1:
-                # Unclosed tag — nothing more to emit
+                # Unclosed tag — enter thinking mode
                 self._inside_thinking = True
+                self._open_tag = earliest_open
+                self._close_tag = earliest_close
                 self._buffer = ""
                 break
-            buf = buf[end + len("</antThinking>"):]
+
+            buf = buf[end + len(earliest_close):]
+
         return "".join(parts)
 
     def filter_remaining(self) -> str:
         """Drain any remaining buffered text (called at end of stream)."""
         if self._inside_thinking:
-            end = self._buffer.find("</antThinking>")
-            if end != -1:
-                self._buffer = self._buffer[end + len("</antThinking>"):]
-                self._inside_thinking = False
+            # If we're still inside a thinking block, discard it.
+            self._inside_thinking = False
+            self._open_tag = ""
+            self._close_tag = ""
         output = self._buffer
         self._buffer = ""
         return output
 
 
 def filter_thinking_text(text: str) -> str:
-    """One-shot filter: remove all <antThinking>...</antThinking> blocks."""
-    return THINKING_TAG_PATTERN.sub("", text)
+    """One-shot filter: remove all thinking blocks."""
+    return _THINKING_TAG_PATTERN.sub("", text)
 
 
 # Content block models
@@ -431,9 +467,7 @@ async def count_tokens_endpoint(request: TokenCountRequest):
 
 async def generate_response(request: MessagesRequest, prompt: str, input_tokens: int):
     """Generate non-streaming response"""
-    # Generate text
-    # MLX generate function parameters
-    response_text = generate(
+    raw_response_text = generate(
         model,
         tokenizer,
         prompt=prompt,
@@ -441,18 +475,23 @@ async def generate_response(request: MessagesRequest, prompt: str, input_tokens:
         verbose=config.VERBOSE,
     )
 
-    # Filter out thinking content
-    if request.thinking and request.thinking.type == "enabled":
-        response_text = filter_thinking_text(response_text).strip()
+    if config.VERBOSE:
+        print(f"DEBUG: Raw response (before filter): {repr(raw_response_text[:500])}")
 
-    # Count output tokens
+    raw_output_tokens = count_tokens(raw_response_text)
+    response_text = filter_thinking_text(raw_response_text).strip()
+
+    if config.VERBOSE:
+        print(f"DEBUG: Filtered response: {repr(response_text[:500])}")
+
     output_tokens = count_tokens(response_text)
+    stop_reason = "max_tokens" if raw_output_tokens >= request.max_tokens else "end_turn"
 
-    # Create Claude-style response
     response = MessageResponse(
         id="msg_" + str(abs(hash(prompt)))[:8],
         content=[ContentBlockText(text=response_text)],
         model=request.model,
+        stop_reason=stop_reason,
         usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
     )
 
@@ -466,9 +505,7 @@ async def stream_generate_response(
     response_id = "msg_" + str(abs(hash(prompt)))[:8]
     full_text = ""
 
-    # Initialize thinking filter if thinking is enabled
-    filter_thinking = request.thinking and request.thinking.type == "enabled"
-    thinking_filter = ThinkingFilter() if filter_thinking else None
+    thinking_filter = ThinkingFilter()
 
     # Send message start event
     message_start = {
@@ -495,19 +532,15 @@ async def stream_generate_response(
     yield f"event: content_block_start\ndata: {json.dumps(content_start)}\n\n"
 
     # Stream generation
-    for i, response in enumerate(
-        stream_generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=request.max_tokens,
-        )
+    generated_token_count = 0
+    for response in stream_generate(
+        model,
+        tokenizer,
+        prompt=prompt,
+        max_tokens=request.max_tokens,
     ):
-        # Filter thinking content if enabled
-        if thinking_filter:
-            filtered_text = thinking_filter.filter_chunk(response.text)
-        else:
-            filtered_text = response.text
+        generated_token_count += 1
+        filtered_text = thinking_filter.filter_chunk(response.text)
 
         if filtered_text:
             full_text += filtered_text
@@ -521,19 +554,23 @@ async def stream_generate_response(
             yield f"event: content_block_delta\ndata: {json.dumps(content_delta)}\n\n"
 
     # Drain any remaining buffered text
-    if thinking_filter:
-        remaining = thinking_filter.filter_remaining()
-        if remaining:
-            full_text += remaining
-            content_delta = {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "text_delta", "text": remaining},
-            }
-            yield f"event: content_block_delta\ndata: {json.dumps(content_delta)}\n\n"
+    remaining = thinking_filter.filter_remaining()
+    if remaining:
+        full_text += remaining
+        content_delta = {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": remaining},
+        }
+        yield f"event: content_block_delta\ndata: {json.dumps(content_delta)}\n\n"
 
-    # Count output tokens
+    # Count output tokens from the visible (filtered) text for usage reporting.
     output_tokens = count_tokens(full_text)
+
+    # Determine stop reason from the raw token count (before filtering).
+    # If the model generated as many tokens as max_tokens, the response was
+    # truncated. Claude Code uses this to decide whether to send a follow-up.
+    stop_reason = "max_tokens" if generated_token_count >= request.max_tokens else "end_turn"
 
     # Send content block stop
     content_stop = {"type": "content_block_stop", "index": 0}
@@ -542,7 +579,7 @@ async def stream_generate_response(
     # Send message delta with usage
     message_delta = {
         "type": "message_delta",
-        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
         "usage": {"output_tokens": output_tokens},
     }
     yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
