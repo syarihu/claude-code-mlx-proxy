@@ -1,4 +1,6 @@
 import json
+import re
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Union, Literal
 from contextlib import asynccontextmanager
 
@@ -8,13 +10,95 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerFast
 from mlx_lm import load, generate, stream_generate
-from mlx_lm.utils import load_model, _download
+from mlx_lm.utils import load_model, hf_repo_to_path, snapshot_download
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from config import config
 
 # Global variables for model and tokenizer
 model = None
 tokenizer = None
+
+# Regex patterns for thinking tags (Anthropic uses <antThinking>)
+THINKING_TAG_PATTERN = re.compile(
+    r"<antThinking>.*?</antThinking>", re.DOTALL
+)
+
+
+class ThinkingFilter:
+    """Stateful filter that strips <antThinking>...</antThinking> blocks from
+    a stream of text chunks.  Tracks whether we are currently inside a
+    thinking block so partial tokens at chunk boundaries are handled
+    correctly."""
+
+    def __init__(self):
+        self._inside_thinking = False
+        self._buffer = ""
+
+    def filter_chunk(self, text: str) -> str:
+        """Return the portion of *text* that is NOT inside a thinking block."""
+        self._buffer += text
+
+        if self._inside_thinking:
+            end = self._buffer.find("</antThinking>")
+            if end == -1:
+                return ""
+            self._buffer = self._buffer[end + len("</antThinking>"):]
+            self._inside_thinking = False
+            # After exiting a thinking block, continue to process the
+            # remainder (which may contain more non-thinking text or
+            # another thinking block).
+        else:
+            return self._drain_non_thinking()
+
+        return self._drain_non_thinking()
+
+    def _drain_non_thinking(self) -> str:
+        """Extract all non-thinking content from the buffer, stripping
+        any <antThinking>...</antThinking> blocks encountered."""
+        parts: List[str] = []
+        buf = self._buffer
+        while True:
+            start = buf.find("<antThinking>")
+            if start == -1:
+                # Check for a partial opening tag at the end of the buffer
+                partial = buf.find("<antThinking")
+                if partial != -1:
+                    # Everything before the partial tag is safe output
+                    parts.append(buf[:partial])
+                    # Keep the partial tag in the buffer
+                    self._buffer = buf[partial:]
+                else:
+                    # No thinking tags at all — everything is output
+                    parts.append(buf)
+                    self._buffer = ""
+                break
+
+            parts.append(buf[:start])
+            buf = buf[start + len("<antThinking>"):]
+            end = buf.find("</antThinking>")
+            if end == -1:
+                # Unclosed tag — nothing more to emit
+                self._inside_thinking = True
+                self._buffer = ""
+                break
+            buf = buf[end + len("</antThinking>"):]
+        return "".join(parts)
+
+    def filter_remaining(self) -> str:
+        """Drain any remaining buffered text (called at end of stream)."""
+        if self._inside_thinking:
+            end = self._buffer.find("</antThinking>")
+            if end != -1:
+                self._buffer = self._buffer[end + len("</antThinking>"):]
+                self._inside_thinking = False
+        output = self._buffer
+        self._buffer = ""
+        return output
+
+
+def filter_thinking_text(text: str) -> str:
+    """One-shot filter: remove all <antThinking>...</antThinking> blocks."""
+    return THINKING_TAG_PATTERN.sub("", text)
 
 
 # Content block models
@@ -47,7 +131,7 @@ class SystemContent(BaseModel):
 
 
 class ThinkingConfig(BaseModel):
-    type: Literal["enabled", "disabled"]
+    type: Literal["enabled", "disabled", "adaptive"]
     budget_tokens: Optional[int] = None
 
 
@@ -141,7 +225,9 @@ def _load_model_with_fallback(model_name: str, tokenizer_config: dict):
 
     # Use cached model files (downloaded by the failed load() call above, or already
     # present from a previous run).
-    model_path = _download(model_name)
+    model_path = Path(hf_repo_to_path(model_name))
+    if not model_path.exists():
+        model_path = Path(snapshot_download(model_name))
     mlx_model, mlx_config = load_model(model_path)
 
     # PreTrainedTokenizerFast.from_pretrained does not do the tokenizer-class
@@ -355,6 +441,10 @@ async def generate_response(request: MessagesRequest, prompt: str, input_tokens:
         verbose=config.VERBOSE,
     )
 
+    # Filter out thinking content
+    if request.thinking and request.thinking.type == "enabled":
+        response_text = filter_thinking_text(response_text).strip()
+
     # Count output tokens
     output_tokens = count_tokens(response_text)
 
@@ -375,6 +465,10 @@ async def stream_generate_response(
     """Generate streaming response"""
     response_id = "msg_" + str(abs(hash(prompt)))[:8]
     full_text = ""
+
+    # Initialize thinking filter if thinking is enabled
+    filter_thinking = request.thinking and request.thinking.type == "enabled"
+    thinking_filter = ThinkingFilter() if filter_thinking else None
 
     # Send message start event
     message_start = {
@@ -409,15 +503,34 @@ async def stream_generate_response(
             max_tokens=request.max_tokens,
         )
     ):
-        full_text += response.text
+        # Filter thinking content if enabled
+        if thinking_filter:
+            filtered_text = thinking_filter.filter_chunk(response.text)
+        else:
+            filtered_text = response.text
 
-        # Send content block delta
-        content_delta = {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": response.text},
-        }
-        yield f"event: content_block_delta\ndata: {json.dumps(content_delta)}\n\n"
+        if filtered_text:
+            full_text += filtered_text
+
+            # Send content block delta
+            content_delta = {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": filtered_text},
+            }
+            yield f"event: content_block_delta\ndata: {json.dumps(content_delta)}\n\n"
+
+    # Drain any remaining buffered text
+    if thinking_filter:
+        remaining = thinking_filter.filter_remaining()
+        if remaining:
+            full_text += remaining
+            content_delta = {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": remaining},
+            }
+            yield f"event: content_block_delta\ndata: {json.dumps(content_delta)}\n\n"
 
     # Count output tokens
     output_tokens = count_tokens(full_text)
@@ -437,6 +550,22 @@ async def stream_generate_response(
     # Send message stop
     message_stop = {"type": "message_stop"}
     yield f"event: message_stop\ndata: {json.dumps(message_stop)}\n\n"
+
+
+@app.get("/v1/models")
+async def list_models():
+    """Return list of available models (Anthropic API compatible)"""
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": config.API_MODEL_NAME,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "mlx",
+            }
+        ],
+    }
 
 
 @app.get("/health")
