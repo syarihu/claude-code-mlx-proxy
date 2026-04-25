@@ -130,11 +130,14 @@ async def _get_backend_model_name() -> str:
     try:
         resp = await http_client.get("/models", timeout=10.0)
         if resp.status_code == 200:
-            models = resp.json().get("data", [])
-            if models:
-                _backend_model_name = models[0]["id"]
-                print(f"Backend model: {_backend_model_name}")
-                return _backend_model_name
+            payload = resp.json()
+            models = payload.get("data", []) if isinstance(payload, dict) else []
+            if models and isinstance(models[0], dict):
+                model_id = models[0].get("id")
+                if model_id:
+                    _backend_model_name = model_id
+                    print(f"Backend model: {_backend_model_name}")
+                    return _backend_model_name
     except Exception as e:
         print(f"Warning: could not query backend models: {e}")
     return "default"
@@ -318,9 +321,22 @@ async def _build_openai_request(request: MessagesRequest) -> dict:
         body["temperature"] = request.temperature
     if request.top_p is not None:
         body["top_p"] = request.top_p
+    if request.stop_sequences:
+        body["stop"] = request.stop_sequences
 
     if config.TOOL_MODE != "none" and request.tools:
         body["tools"] = _anthropic_tools_to_openai(request.tools)
+        if request.tool_choice:
+            tc_type = request.tool_choice.get("type")
+            if tc_type == "auto":
+                body["tool_choice"] = "auto"
+            elif tc_type == "any":
+                body["tool_choice"] = "required"
+            elif tc_type == "tool":
+                body["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": request.tool_choice.get("name", "")},
+                }
 
     if request.stream:
         body["stream_options"] = {"include_usage": True}
@@ -377,7 +393,7 @@ def _convert_response(openai_data: dict, request: MessagesRequest) -> MessageRes
             arguments = {}
         content.append(
             ContentBlockToolUse(
-                id=_make_tool_use_id(),
+                id=tc.get("id") or _make_tool_use_id(),
                 name=fn.get("name", "unknown"),
                 input=arguments,
             )
@@ -520,7 +536,7 @@ async def _stream_response(
                         "index": block_index,
                         "content_block": {
                             "type": "tool_use",
-                            "id": _make_tool_use_id(),
+                            "id": tc.get("id") or _make_tool_use_id(),
                             "name": fn.get("name", "unknown"),
                             "input": {},
                         },
