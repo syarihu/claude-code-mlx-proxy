@@ -556,7 +556,7 @@ async def _stream_response(
                 "stop_reason": _map_finish_reason(finish_reason),
                 "stop_sequence": None,
             },
-            "usage": {"output_tokens": output_tokens},
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
         },
     )
     yield _sse("message_stop", {"type": "message_stop"})
