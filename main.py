@@ -185,6 +185,44 @@ def _extract_system_text(
     return None
 
 
+SLIM_TOOL_GUIDE = """\
+# Tool usage guide
+
+## Agent
+- subagent_type options: "Explore" (codebase search, find files/keywords), "Plan" (architecture design), "claude-code-guide" (Claude Code questions), "general-purpose" (multi-step tasks), "statusline-setup"
+- For broad codebase exploration (>3 queries), use Agent with subagent_type="Explore"
+- If target is already known, use Read or Bash(grep) directly instead
+- Always include description and prompt params; prompt should be self-contained
+
+## Bash
+- Use Read/Edit/Write tools instead of cat/sed/echo
+- Git: always create NEW commits (never amend unless asked), never force push, never --no-verify
+- Git commit format: use HEREDOC — git commit -m "$(cat <<'EOF'\\nmessage\\nEOF\\n)"
+- PR: use gh pr create with --title and --body (HEREDOC)
+- Use run_in_background for long-running commands
+
+## Edit
+- Must Read the file first before editing
+- old_string must be unique in the file; add surrounding context if not
+- Use replace_all=true to rename across file
+
+## Read
+- Use absolute paths; supports images, PDFs (use pages param for large ones), notebooks
+
+## Write
+- Must Read existing files first; prefer Edit for modifications
+- Only use for new files or complete rewrites
+
+## EnterPlanMode
+- Use proactively for non-trivial implementation tasks before writing code
+- Skip for simple fixes, typos, single-line changes
+
+## Skill
+- When user types "/<name>", invoke via Skill tool with that name
+- Only use skills listed in system-reminder messages
+"""
+
+
 def _anthropic_tools_to_openai(tools: List[Tool]) -> List[dict]:
     result = []
     for t in tools:
@@ -212,12 +250,15 @@ def _anthropic_tools_to_openai(tools: List[Tool]) -> List[dict]:
             }
             if required:
                 slim_params["required"] = required
+            desc = t.description or ""
+            if t.name not in config.TOOL_FULL_DESC_NAMES and config.TOOL_DESC_LIMIT > 0:
+                desc = desc[:config.TOOL_DESC_LIMIT]
             result.append(
                 {
                     "type": "function",
                     "function": {
                         "name": t.name,
-                        "description": (t.description or "")[:200],
+                        "description": desc,
                         "parameters": slim_params,
                     },
                 }
@@ -260,6 +301,8 @@ def _anthropic_messages_to_openai(
     result: List[dict] = []
 
     system_text = _extract_system_text(system)
+    if config.TOOL_MODE == "slim":
+        system_text = f"{system_text}\n\n{SLIM_TOOL_GUIDE}" if system_text else SLIM_TOOL_GUIDE
     if config.RESPONSE_LANGUAGE:
         lang_instruction = f"You must always respond in {config.RESPONSE_LANGUAGE}."
         system_text = f"{system_text}\n\n{lang_instruction}" if system_text else lang_instruction
@@ -631,6 +674,8 @@ async def create_message(request: MessagesRequest):
             f"[/v1/messages] tools={n_tools}, tool_mode={config.TOOL_MODE}, "
             f"stream={request.stream}"
         )
+        if openai_body.get("tools"):
+            print("[tools] " + json.dumps(openai_body["tools"], ensure_ascii=False, indent=2))
 
     try:
         if request.stream:

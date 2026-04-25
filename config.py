@@ -23,6 +23,17 @@ class Config:
     # name + description + required param names, "none" omits tools entirely.
     TOOL_MODE: str = os.getenv("TOOL_MODE", "slim")
 
+    # Max chars for tool descriptions in slim mode (0 = no limit).
+    TOOL_DESC_LIMIT: int = int(os.getenv("TOOL_DESC_LIMIT", "200"))
+
+    # Comma-separated tool names whose descriptions are never truncated
+    # in slim mode (e.g. "Agent,Bash").
+    TOOL_FULL_DESC_NAMES: list = [
+        n.strip()
+        for n in os.getenv("TOOL_FULL_DESC_NAMES", "").split(",")
+        if n.strip()
+    ]
+
     # Response language — when set, injects a language instruction into
     # the system prompt (e.g. "ja", "en", "zh").  Unset = no injection.
     RESPONSE_LANGUAGE: str = os.getenv("RESPONSE_LANGUAGE", "")
