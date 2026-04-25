@@ -191,12 +191,24 @@ def _anthropic_tools_to_openai(tools: List[Tool]) -> List[dict]:
         if config.TOOL_MODE == "slim":
             props = t.input_schema.get("properties", {})
             required = t.input_schema.get("required", [])
+            slim_props: Dict[str, Any] = {}
+            for k, v in props.items():
+                sp: Dict[str, Any] = {"type": v.get("type", "string")}
+                if "enum" in v:
+                    sp["enum"] = v["enum"]
+                desc = v.get("description", "")
+                if desc:
+                    sp["description"] = desc[:100]
+                if v.get("type") == "array" and "items" in v:
+                    items = v["items"]
+                    slim_items: Dict[str, Any] = {"type": items.get("type", "string")}
+                    if "enum" in items:
+                        slim_items["enum"] = items["enum"]
+                    sp["items"] = slim_items
+                slim_props[k] = sp
             slim_params: Dict[str, Any] = {
                 "type": "object",
-                "properties": {
-                    k: {"type": v.get("type", "string")}
-                    for k, v in props.items()
-                },
+                "properties": slim_props,
             }
             if required:
                 slim_params["required"] = required
