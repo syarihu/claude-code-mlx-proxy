@@ -125,6 +125,11 @@ async def _get_backend_model_name() -> str:
     global _backend_model_name
     if _backend_model_name is not None:
         return _backend_model_name
+    # Use forced model name if set (e.g. local path for MLX backends)
+    if config.MODEL_NAME:
+        _backend_model_name = config.MODEL_NAME
+        print(f"Using forced model name: {_backend_model_name}")
+        return _backend_model_name
     if http_client is None:
         return "default"
     try:
