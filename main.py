@@ -128,7 +128,7 @@ async def _get_backend_model_name() -> str:
     if http_client is None:
         return "default"
     try:
-        resp = await http_client.get("/models", timeout=10.0)
+        resp = await http_client.get("models", timeout=10.0)
         if resp.status_code == 200:
             payload = resp.json()
             models = payload.get("data", []) if isinstance(payload, dict) else []
@@ -600,7 +600,7 @@ async def create_message(request: MessagesRequest):
     try:
         if request.stream:
             req = http_client.build_request(
-                "POST", "/chat/completions", json=openai_body
+                "POST", "chat/completions", json=openai_body
             )
             resp = await http_client.send(req, stream=True)
             if resp.status_code != 200:
@@ -622,7 +622,7 @@ async def create_message(request: MessagesRequest):
             )
 
         # Non-streaming
-        resp = await http_client.post("/chat/completions", json=openai_body)
+        resp = await http_client.post("chat/completions", json=openai_body)
         if resp.status_code != 200:
             raise HTTPException(
                 status_code=resp.status_code, detail=resp.text
@@ -669,7 +669,7 @@ async def health_check():
     backend_ok = False
     if http_client:
         try:
-            resp = await http_client.get("/models", timeout=5.0)
+            resp = await http_client.get("models", timeout=5.0)
             backend_ok = resp.status_code == 200
         except Exception:
             pass
