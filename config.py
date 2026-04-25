@@ -30,5 +30,11 @@ class Config:
     # Logging
     VERBOSE: bool = os.getenv("VERBOSE", "false").lower() == "true"
 
+    # Force model name — when set, overrides the backend's reported model name.
+    # Useful when the MLX backend loads from a local path but reports an HF
+    # repo ID (e.g. "unsloth/...").  Setting this to the local path ensures
+    # the proxy sends requests that the backend can resolve correctly.
+    MODEL_NAME: str = os.getenv("MODEL_NAME", "")
+
 
 config = Config()
