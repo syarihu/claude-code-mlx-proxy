@@ -23,6 +23,10 @@ class Config:
     # name + description + required param names, "none" omits tools entirely.
     TOOL_MODE: str = os.getenv("TOOL_MODE", "slim")
 
+    # Response language — when set, injects a language instruction into
+    # the system prompt (e.g. "ja", "en", "zh").  Unset = no injection.
+    RESPONSE_LANGUAGE: str = os.getenv("RESPONSE_LANGUAGE", "")
+
     # Logging
     VERBOSE: bool = os.getenv("VERBOSE", "false").lower() == "true"
 

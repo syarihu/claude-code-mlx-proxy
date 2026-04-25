@@ -146,12 +146,17 @@ async def _get_backend_model_name() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
+    base_url = (
+        config.MLX_SERVER_URL
+        if config.MLX_SERVER_URL.endswith("/")
+        else f"{config.MLX_SERVER_URL}/"
+    )
     http_client = httpx.AsyncClient(
-        base_url=config.MLX_SERVER_URL,
+        base_url=base_url,
         timeout=httpx.Timeout(connect=10.0, read=600.0, write=10.0, pool=10.0),
     )
     await _get_backend_model_name()
-    print(f"Proxy started — forwarding to {config.MLX_SERVER_URL}")
+    print(f"Proxy started — forwarding to {base_url}")
     yield
     await http_client.aclose()
     print("Shutting down...")
@@ -238,6 +243,9 @@ def _anthropic_messages_to_openai(
     result: List[dict] = []
 
     system_text = _extract_system_text(system)
+    if config.RESPONSE_LANGUAGE:
+        lang_instruction = f"You must always respond in {config.RESPONSE_LANGUAGE}."
+        system_text = f"{system_text}\n\n{lang_instruction}" if system_text else lang_instruction
     if system_text:
         result.append({"role": "system", "content": system_text})
 
@@ -279,24 +287,28 @@ def _anthropic_messages_to_openai(
             result.append(entry)
 
         elif msg.role == "user":
-            text_parts = []
-            tool_results: List[dict] = []
+            text_parts: List[str] = []
+
+            def flush_user_text() -> None:
+                if text_parts:
+                    result.append({"role": "user", "content": "\n".join(text_parts)})
+                    text_parts.clear()
+
             for block in msg.content:
                 btype = getattr(block, "type", None)
                 if btype == "text":
                     text_parts.append(block.text)
                 elif btype == "tool_result":
-                    tool_results.append(
+                    flush_user_text()
+                    result.append(
                         {
                             "role": "tool",
                             "tool_call_id": block.tool_use_id,
                             "content": _tool_result_to_str(block.content),
                         }
                     )
-            for tr in tool_results:
-                result.append(tr)
-            if text_parts:
-                result.append({"role": "user", "content": "\n".join(text_parts)})
+
+            flush_user_text()
 
     return result
 
@@ -333,9 +345,15 @@ async def _build_openai_request(request: MessagesRequest) -> dict:
             elif tc_type == "any":
                 body["tool_choice"] = "required"
             elif tc_type == "tool":
+                tool_name = request.tool_choice.get("name")
+                if not isinstance(tool_name, str) or not tool_name.strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="tool_choice.name is required when tool_choice.type is 'tool'.",
+                    )
                 body["tool_choice"] = {
                     "type": "function",
-                    "function": {"name": request.tool_choice.get("name", "")},
+                    "function": {"name": tool_name},
                 }
 
     if request.stream:
