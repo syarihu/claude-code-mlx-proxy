@@ -1,23 +1,21 @@
 import json
+import uuid
 from typing import List, Dict, Any, Optional, Union, Literal
 from contextlib import asynccontextmanager
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from transformers import PreTrainedTokenizerFast
-from mlx_lm import load, generate, stream_generate
-from mlx_lm.utils import load_model, _download
-from mlx_lm.tokenizer_utils import TokenizerWrapper
 from config import config
 
-# Global variables for model and tokenizer
-model = None
-tokenizer = None
+
+# ---------------------------------------------------------------------------
+# Pydantic models (Anthropic Messages API)
+# ---------------------------------------------------------------------------
 
 
-# Content block models
 class ContentBlockText(BaseModel):
     type: Literal["text"] = "text"
     text: str
@@ -47,7 +45,7 @@ class SystemContent(BaseModel):
 
 
 class ThinkingConfig(BaseModel):
-    type: Literal["enabled", "disabled"]
+    type: Literal["enabled", "disabled", "adaptive"]
     budget_tokens: Optional[int] = None
 
 
@@ -108,340 +106,592 @@ class MessageResponse(BaseModel):
     id: str
     type: str = "message"
     role: str = "assistant"
-    content: List[ContentBlockText]
+    content: List[Union[ContentBlockText, ContentBlockToolUse]]
     model: str
     stop_reason: str = "end_turn"
     stop_sequence: Optional[str] = None
     usage: Usage
 
 
-class MessageStreamResponse(BaseModel):
-    type: str
-    index: Optional[int] = None
-    delta: Optional[Dict[str, Any]] = None
-    usage: Optional[Usage] = None
+# ---------------------------------------------------------------------------
+# App lifecycle
+# ---------------------------------------------------------------------------
+
+http_client: Optional[httpx.AsyncClient] = None
+_backend_model_name: Optional[str] = None
 
 
-def _load_model_with_fallback(model_name: str, tokenizer_config: dict):
-    """Load model and tokenizer, falling back to PreTrainedTokenizerFast when
-    the model's tokenizer uses the Transformers v5 TokenizersBackend class which
-    is not available in older Transformers installations.
-    """
+async def _get_backend_model_name() -> str:
+    global _backend_model_name
+    if _backend_model_name is not None:
+        return _backend_model_name
+    if http_client is None:
+        return "default"
     try:
-        return load(model_name, tokenizer_config=tokenizer_config)
-    except ValueError as e:
-        if "TokenizersBackend" not in str(e):
-            raise
-        print(
-            "Warning: Failed to load tokenizer via AutoTokenizer (TokenizersBackend not "
-            "found). This typically means the model was saved with Transformers v5 but an "
-            "older version is installed. Upgrading to 'transformers>=5.0.0' is recommended. "
-            "Attempting fallback using PreTrainedTokenizerFast..."
-        )
-
-    # Use cached model files (downloaded by the failed load() call above, or already
-    # present from a previous run).
-    model_path = _download(model_name)
-    mlx_model, mlx_config = load_model(model_path)
-
-    # PreTrainedTokenizerFast.from_pretrained does not do the tokenizer-class
-    # name lookup that AutoTokenizer performs, so it avoids the TokenizersBackend
-    # error while still reading tokenizer.json correctly.
-    hf_tokenizer = PreTrainedTokenizerFast.from_pretrained(
-        str(model_path), **tokenizer_config
-    )
-    eos_token_id = mlx_config.get("eos_token_id")
-    tokenizer = TokenizerWrapper(hf_tokenizer, eos_token_ids=eos_token_id)
-
-    return mlx_model, tokenizer
+        resp = await http_client.get("models", timeout=10.0)
+        if resp.status_code == 200:
+            payload = resp.json()
+            models = payload.get("data", []) if isinstance(payload, dict) else []
+            if models and isinstance(models[0], dict):
+                model_id = models[0].get("id")
+                if model_id:
+                    _backend_model_name = model_id
+                    print(f"Backend model: {_backend_model_name}")
+                    return _backend_model_name
+    except Exception as e:
+        print(f"Warning: could not query backend models: {e}")
+    return "default"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load model on startup
-    global model, tokenizer
-    print(f"Loading MLX model: {config.MODEL_NAME}")
-
-    # Prepare tokenizer config
-    tokenizer_config = {}
-    if config.TRUST_REMOTE_CODE:
-        tokenizer_config["trust_remote_code"] = True
-    if config.EOS_TOKEN:
-        tokenizer_config["eos_token"] = config.EOS_TOKEN
-
-    model, tokenizer = _load_model_with_fallback(config.MODEL_NAME, tokenizer_config)
-    print("Model loaded successfully!")
+    global http_client
+    base_url = (
+        config.MLX_SERVER_URL
+        if config.MLX_SERVER_URL.endswith("/")
+        else f"{config.MLX_SERVER_URL}/"
+    )
+    http_client = httpx.AsyncClient(
+        base_url=base_url,
+        timeout=httpx.Timeout(connect=10.0, read=600.0, write=10.0, pool=10.0),
+    )
+    await _get_backend_model_name()
+    print(f"Proxy started — forwarding to {base_url}")
     yield
-    # Cleanup on shutdown
+    await http_client.aclose()
     print("Shutting down...")
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-def extract_text_from_content(
-    content: Union[
-        str,
-        List[
-            Union[
-                ContentBlockText,
-                ContentBlockImage,
-                ContentBlockToolUse,
-                ContentBlockToolResult,
-            ]
-        ],
-    ],
-) -> str:
-    """Extract text content from Claude-style content blocks"""
-    if isinstance(content, str):
-        return content
-
-    text_parts = []
-    for block in content:
-        if hasattr(block, "type") and block.type == "text":
-            text_parts.append(block.text)
-        elif isinstance(block, dict) and block.get("type") == "text":
-            text_parts.append(block.get("text", ""))
-
-    return " ".join(text_parts)
+# ---------------------------------------------------------------------------
+# Format conversion: Anthropic → OpenAI
+# ---------------------------------------------------------------------------
 
 
-def extract_system_text(
+def _extract_system_text(
     system: Optional[Union[str, List[SystemContent]]],
 ) -> Optional[str]:
-    """Extract system text from system parameter"""
     if isinstance(system, str):
         return system
-    elif isinstance(system, list):
-        return " ".join([content.text for content in system])
+    if isinstance(system, list):
+        return " ".join(c.text for c in system)
     return None
 
 
-def format_messages_for_llama(
-    messages: List[Message], system: Optional[Union[str, List[SystemContent]]] = None
-) -> str:
-    """Convert Claude-style messages to Llama format"""
-    formatted_messages = []
-
-    # Add system message if provided
-    system_text = extract_system_text(system)
-    if system_text:
-        formatted_messages.append({"role": "system", "content": system_text})
-
-    # Add user messages
-    for message in messages:
-        content_text = extract_text_from_content(message.content)
-        formatted_messages.append({"role": message.role, "content": content_text})
-
-    # Apply chat template if available
-    if tokenizer.chat_template is not None:
-        try:
-            result = tokenizer.apply_chat_template(
-                formatted_messages, add_generation_prompt=True, tokenize=False
+def _anthropic_tools_to_openai(tools: List[Tool]) -> List[dict]:
+    result = []
+    for t in tools:
+        if config.TOOL_MODE == "slim":
+            props = t.input_schema.get("properties", {})
+            required = t.input_schema.get("required", [])
+            slim_params: Dict[str, Any] = {
+                "type": "object",
+                "properties": {
+                    k: {"type": v.get("type", "string")}
+                    for k, v in props.items()
+                },
+            }
+            if required:
+                slim_params["required"] = required
+            result.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": (t.description or "")[:200],
+                        "parameters": slim_params,
+                    },
+                }
             )
-            # Ensure we return a string, not tokens
-            if isinstance(result, str):
-                return result
-        except Exception:
-            # Fall through to manual formatting if template fails
-            pass
-
-    # Fallback formatting (used if no template or template fails)
-    prompt = ""
-    for msg in formatted_messages:
-        if msg["role"] == "system":
-            prompt += f"<|system|>\n{msg['content']}\n<|end|>\n"
-        elif msg["role"] == "user":
-            prompt += f"<|user|>\n{msg['content']}\n<|end|>\n"
-        elif msg["role"] == "assistant":
-            prompt += f"<|assistant|>\n{msg['content']}\n<|end|>\n"
-    prompt += "<|assistant|>\n"
-    return prompt
+        else:
+            result.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description or "",
+                        "parameters": t.input_schema,
+                    },
+                }
+            )
+    return result
 
 
-def count_tokens(text: str) -> int:
-    """Count tokens in text"""
-    try:
-        # MLX tokenizers often expect the text to be handled through their specific methods
-        # First try the standard approach with proper string handling
-        if isinstance(text, str) and text.strip():
-            # For MLX, we may need to use a different approach
-            # Try to get tokens using the tokenizer's __call__ method or encode
-            try:
-                # Some MLX tokenizers work better with this approach
-                result = tokenizer(text, return_tensors=False, add_special_tokens=False)
-                if isinstance(result, dict) and "input_ids" in result:
-                    return len(result["input_ids"])
-                elif hasattr(result, "__len__"):
-                    return len(result)
-            except (AttributeError, TypeError, ValueError):
-                pass
+def _tool_result_to_str(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    if isinstance(content, dict) and content.get("type") == "text":
+        return content.get("text", "")
+    return str(content) if content else ""
 
-            # Try direct encode without parameters
-            try:
-                encoded = tokenizer.encode(text)
-                return (
-                    len(encoded) if hasattr(encoded, "__len__") else len(list(encoded))
+
+def _anthropic_messages_to_openai(
+    messages: List[Message],
+    system: Optional[Union[str, List[SystemContent]]] = None,
+) -> List[dict]:
+    """Convert Anthropic-format messages to OpenAI chat messages."""
+    result: List[dict] = []
+
+    system_text = _extract_system_text(system)
+    if config.RESPONSE_LANGUAGE:
+        lang_instruction = f"You must always respond in {config.RESPONSE_LANGUAGE}."
+        system_text = f"{system_text}\n\n{lang_instruction}" if system_text else lang_instruction
+    if system_text:
+        result.append({"role": "system", "content": system_text})
+
+    for msg in messages:
+        if isinstance(msg.content, str):
+            result.append({"role": msg.role, "content": msg.content})
+            continue
+
+        if msg.role == "assistant":
+            text_parts: List[str] = []
+            tc_list: List[dict] = []
+            for block in msg.content:
+                btype = getattr(block, "type", None)
+                if btype == "text":
+                    text_parts.append(block.text)
+                elif btype == "tool_use":
+                    tc_list.append(
+                        {
+                            "id": block.id,
+                            "type": "function",
+                            "function": {
+                                "name": block.name,
+                                "arguments": (
+                                    json.dumps(block.input)
+                                    if isinstance(block.input, dict)
+                                    else "{}"
+                                ),
+                            },
+                        }
+                    )
+            entry: dict = {"role": "assistant"}
+            text = "\n".join(text_parts) if text_parts else None
+            if text:
+                entry["content"] = text
+            if tc_list:
+                entry["tool_calls"] = tc_list
+            if not text and not tc_list:
+                entry["content"] = ""
+            result.append(entry)
+
+        elif msg.role == "user":
+            text_parts: List[str] = []
+
+            def flush_user_text() -> None:
+                if text_parts:
+                    result.append({"role": "user", "content": "\n".join(text_parts)})
+                    text_parts.clear()
+
+            for block in msg.content:
+                btype = getattr(block, "type", None)
+                if btype == "text":
+                    text_parts.append(block.text)
+                elif btype == "tool_result":
+                    flush_user_text()
+                    result.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": block.tool_use_id,
+                            "content": _tool_result_to_str(block.content),
+                        }
+                    )
+
+            flush_user_text()
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Build OpenAI request body
+# ---------------------------------------------------------------------------
+
+
+async def _build_openai_request(request: MessagesRequest) -> dict:
+    chat_messages = _anthropic_messages_to_openai(request.messages, request.system)
+    model_name = await _get_backend_model_name()
+
+    body: dict = {
+        "model": model_name,
+        "messages": chat_messages,
+        "max_tokens": request.max_tokens,
+        "stream": request.stream or False,
+    }
+
+    if request.temperature is not None:
+        body["temperature"] = request.temperature
+    if request.top_p is not None:
+        body["top_p"] = request.top_p
+    if request.stop_sequences:
+        body["stop"] = request.stop_sequences
+
+    if config.TOOL_MODE != "none" and request.tools:
+        body["tools"] = _anthropic_tools_to_openai(request.tools)
+        if request.tool_choice:
+            tc_type = request.tool_choice.get("type")
+            if tc_type == "auto":
+                body["tool_choice"] = "auto"
+            elif tc_type == "any":
+                body["tool_choice"] = "required"
+            elif tc_type == "tool":
+                tool_name = request.tool_choice.get("name")
+                if not isinstance(tool_name, str) or not tool_name.strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="tool_choice.name is required when tool_choice.type is 'tool'.",
+                    )
+                body["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tool_name},
+                }
+
+    if request.stream:
+        body["stream_options"] = {"include_usage": True}
+
+    return body
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_tool_use_id() -> str:
+    return "toolu_" + uuid.uuid4().hex[:24]
+
+
+def _make_msg_id() -> str:
+    return "msg_" + uuid.uuid4().hex[:8]
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _map_finish_reason(fr: Optional[str]) -> str:
+    if fr == "tool_calls":
+        return "tool_use"
+    if fr == "length":
+        return "max_tokens"
+    return "end_turn"
+
+
+# ---------------------------------------------------------------------------
+# Non-streaming response converter
+# ---------------------------------------------------------------------------
+
+
+def _convert_response(openai_data: dict, request: MessagesRequest) -> MessageResponse:
+    choice = openai_data.get("choices", [{}])[0]
+    message = choice.get("message", {})
+    usage = openai_data.get("usage", {})
+
+    content: List[Union[ContentBlockText, ContentBlockToolUse]] = []
+
+    text = message.get("content")
+    if text:
+        content.append(ContentBlockText(text=text))
+
+    for tc in message.get("tool_calls", []):
+        fn = tc.get("function", {})
+        try:
+            arguments = json.loads(fn.get("arguments", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            arguments = {}
+        content.append(
+            ContentBlockToolUse(
+                id=tc.get("id") or _make_tool_use_id(),
+                name=fn.get("name", "unknown"),
+                input=arguments,
+            )
+        )
+
+    if not content:
+        content.append(ContentBlockText(text=""))
+
+    return MessageResponse(
+        id=_make_msg_id(),
+        content=content,
+        model=request.model,
+        stop_reason=_map_finish_reason(choice.get("finish_reason")),
+        usage=Usage(
+            input_tokens=usage.get("prompt_tokens", 0),
+            output_tokens=usage.get("completion_tokens", 0),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Streaming response converter
+# ---------------------------------------------------------------------------
+
+
+async def _stream_response(
+    response: httpx.Response, request: MessagesRequest
+):
+    msg_id = _make_msg_id()
+
+    yield _sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": request.model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        },
+    )
+
+    block_index = 0
+    text_block_open = False
+    finish_reason = None
+    input_tokens = 0
+    output_tokens = 0
+
+    def _open_text_block():
+        nonlocal text_block_open
+        if text_block_open:
+            return None
+        text_block_open = True
+        return _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+
+    def _close_text_block():
+        nonlocal block_index, text_block_open
+        if not text_block_open:
+            return None
+        text_block_open = False
+        msg = _sse(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": block_index},
+        )
+        block_index += 1
+        return msg
+
+    async for line in response.aiter_lines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:]
+        if payload.strip() == "[DONE]":
+            break
+
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+        if "usage" in data:
+            u = data["usage"]
+            input_tokens = u.get("prompt_tokens", input_tokens)
+            output_tokens = u.get("completion_tokens", output_tokens)
+
+        choice = (data.get("choices") or [{}])[0]
+        delta = choice.get("delta", {})
+        fr = choice.get("finish_reason")
+        if fr:
+            finish_reason = fr
+
+        if config.VERBOSE:
+            keys = [k for k in delta if k != "role"]
+            if keys:
+                preview = {k: (delta[k][:80] if isinstance(delta[k], str) else delta[k]) for k in keys}
+                print(f"  delta: {preview}", flush=True)
+
+        # Text content
+        text = delta.get("content")
+        if text:
+            msg = _open_text_block()
+            if msg:
+                yield msg
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+            )
+
+        # Tool calls (sent as complete objects by mlx-lm)
+        tool_calls = delta.get("tool_calls")
+        if tool_calls:
+            msg = _close_text_block()
+            if msg:
+                yield msg
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                try:
+                    arguments = json.loads(fn.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    arguments = {}
+                yield _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tc.get("id") or _make_tool_use_id(),
+                            "name": fn.get("name", "unknown"),
+                            "input": {},
+                        },
+                    },
                 )
-            except (AttributeError, TypeError, ValueError):
-                pass
+                yield _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": json.dumps(arguments),
+                        },
+                    },
+                )
+                yield _sse(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": block_index},
+                )
+                block_index += 1
 
-            # Try with explicit string conversion and basic parameters
-            try:
-                tokens = tokenizer.encode(str(text), add_special_tokens=False)
-                return len(tokens)
-            except (AttributeError, TypeError, ValueError):
-                pass
+    # Close any remaining text block
+    msg = _close_text_block()
+    if msg:
+        yield msg
 
-        # Final fallback: character-based estimation
-        return max(1, len(str(text)) // 4)  # At least 1 token, ~4 chars per token
+    yield _sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": _map_finish_reason(finish_reason),
+                "stop_sequence": None,
+            },
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        },
+    )
+    yield _sse("message_stop", {"type": "message_stop"})
 
-    except Exception as e:
-        print(f"Token counting failed with error: {e}")
-        return max(1, len(str(text)) // 4)  # Fallback estimation
+
+# ---------------------------------------------------------------------------
+# API endpoints
+# ---------------------------------------------------------------------------
 
 
 @app.post("/v1/messages")
 async def create_message(request: MessagesRequest):
-    if model is None or tokenizer is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+    if http_client is None:
+        raise HTTPException(status_code=503, detail="Proxy not initialized")
+
+    openai_body = await _build_openai_request(request)
+    n_tools = len(request.tools) if request.tools else 0
+
+    if config.VERBOSE:
+        print(
+            f"[/v1/messages] tools={n_tools}, tool_mode={config.TOOL_MODE}, "
+            f"stream={request.stream}"
+        )
 
     try:
-        # Format messages for Llama
-        prompt = format_messages_for_llama(request.messages, request.system)
-
-        # Count input tokens
-        input_tokens = count_tokens(prompt)
-
         if request.stream:
-            return StreamingResponse(
-                stream_generate_response(request, prompt, input_tokens),
-                media_type="text/event-stream",
+            req = http_client.build_request(
+                "POST", "chat/completions", json=openai_body
             )
-        else:
-            return await generate_response(request, prompt, input_tokens)
+            resp = await http_client.send(req, stream=True)
+            if resp.status_code != 200:
+                body = await resp.aread()
+                await resp.aclose()
+                raise HTTPException(
+                    status_code=resp.status_code, detail=body.decode()
+                )
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            async def stream_wrapper():
+                try:
+                    async for chunk in _stream_response(resp, request):
+                        yield chunk
+                finally:
+                    await resp.aclose()
+
+            return StreamingResponse(
+                stream_wrapper(), media_type="text/event-stream"
+            )
+
+        # Non-streaming
+        resp = await http_client.post("chat/completions", json=openai_body)
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=resp.status_code, detail=resp.text
+            )
+        return _convert_response(resp.json(), request)
+
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Cannot connect to mlx-lm server at {config.MLX_SERVER_URL}",
+        )
 
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens_endpoint(request: TokenCountRequest):
-    if tokenizer is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-
-    try:
-        # Format messages for token counting
-        prompt = format_messages_for_llama(request.messages, request.system)
-
-        # Count tokens
-        token_count = count_tokens(prompt)
-
-        return {"input_tokens": token_count}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-async def generate_response(request: MessagesRequest, prompt: str, input_tokens: int):
-    """Generate non-streaming response"""
-    # Generate text
-    # MLX generate function parameters
-    response_text = generate(
-        model,
-        tokenizer,
-        prompt=prompt,
-        max_tokens=request.max_tokens,
-        verbose=config.VERBOSE,
+    text = json.dumps(
+        _anthropic_messages_to_openai(request.messages, request.system)
     )
-
-    # Count output tokens
-    output_tokens = count_tokens(response_text)
-
-    # Create Claude-style response
-    response = MessageResponse(
-        id="msg_" + str(abs(hash(prompt)))[:8],
-        content=[ContentBlockText(text=response_text)],
-        model=request.model,
-        usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
-    )
-
-    return response
+    return {"input_tokens": max(1, len(text) // 4)}
 
 
-async def stream_generate_response(
-    request: MessagesRequest, prompt: str, input_tokens: int
-):
-    """Generate streaming response"""
-    response_id = "msg_" + str(abs(hash(prompt)))[:8]
-    full_text = ""
+# ---------------------------------------------------------------------------
+# Utility endpoints
+# ---------------------------------------------------------------------------
 
-    # Send message start event
-    message_start = {
-        "type": "message_start",
-        "message": {
-            "id": response_id,
-            "type": "message",
-            "role": "assistant",
-            "content": [],
-            "model": request.model,
-            "stop_reason": None,
-            "stop_sequence": None,
-            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-        },
+
+@app.get("/v1/models")
+async def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": config.API_MODEL_NAME,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "mlx",
+            }
+        ],
     }
-    yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
-
-    # Send content block start
-    content_start = {
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {"type": "text", "text": ""},
-    }
-    yield f"event: content_block_start\ndata: {json.dumps(content_start)}\n\n"
-
-    # Stream generation
-    for i, response in enumerate(
-        stream_generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=request.max_tokens,
-        )
-    ):
-        full_text += response.text
-
-        # Send content block delta
-        content_delta = {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": response.text},
-        }
-        yield f"event: content_block_delta\ndata: {json.dumps(content_delta)}\n\n"
-
-    # Count output tokens
-    output_tokens = count_tokens(full_text)
-
-    # Send content block stop
-    content_stop = {"type": "content_block_stop", "index": 0}
-    yield f"event: content_block_stop\ndata: {json.dumps(content_stop)}\n\n"
-
-    # Send message delta with usage
-    message_delta = {
-        "type": "message_delta",
-        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-        "usage": {"output_tokens": output_tokens},
-    }
-    yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
-
-    # Send message stop
-    message_stop = {"type": "message_stop"}
-    yield f"event: message_stop\ndata: {json.dumps(message_stop)}\n\n"
 
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "model_loaded": model is not None}
+    backend_ok = False
+    if http_client:
+        try:
+            resp = await http_client.get("models", timeout=5.0)
+            backend_ok = resp.status_code == 200
+        except Exception:
+            pass
+    return {"status": "healthy" if backend_ok else "degraded", "backend": backend_ok}
 
 
 @app.get("/")
@@ -449,7 +699,7 @@ async def root():
     return {
         "message": "Claude Code MLX Proxy",
         "status": "running",
-        "model_loaded": model is not None,
+        "backend": config.MLX_SERVER_URL,
     }
 
 
