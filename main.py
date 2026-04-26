@@ -819,12 +819,13 @@ async def _run_web_search_loop(openai_body: dict) -> dict:
 async def _stream_with_web_search(openai_body: dict, request: MessagesRequest):
     """Stream the backend response, intercepting WebSearch tool calls inline.
 
-    Text deltas are forwarded to the client as they arrive, so a request that
-    happens to never call WebSearch keeps native streaming TTFB. WebSearch
-    tool calls are accumulated, executed internally via Tavily, and the
-    follow-up iteration's tokens continue streaming as more text deltas in
-    the same Anthropic message — the WebSearch round-trip is invisible to
-    the client.
+    The first iteration streams text deltas to the client immediately so
+    requests that never invoke WebSearch keep native streaming TTFB. Once a
+    WebSearch tool call is detected, subsequent iterations switch into
+    "buffer mode": their text is accumulated locally and only emitted if the
+    iteration finishes without calling WebSearch again. This prevents the
+    user from seeing the same preamble repeated when a small local model
+    keeps re-issuing WebSearch calls before producing a final answer.
 
     If the model emits a mix of WebSearch and other tool calls in a single
     response, the proxy bails out and forwards every tool call to the client
@@ -855,6 +856,7 @@ async def _stream_with_web_search(openai_body: dict, request: MessagesRequest):
     total_output_tokens = 0
     final_finish_reason: Optional[str] = None
     completed = False
+    streaming_text = True  # Real-time stream until first WebSearch detected.
 
     current_body = dict(openai_body)
     current_body["stream"] = True
@@ -938,24 +940,25 @@ async def _stream_with_web_search(openai_body: dict, request: MessagesRequest):
                 text = delta.get("content")
                 if text:
                     accumulated_text_parts.append(text)
-                    if not text_block_open:
+                    if streaming_text:
+                        if not text_block_open:
+                            yield _sse(
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": block_index,
+                                    "content_block": {"type": "text", "text": ""},
+                                },
+                            )
+                            text_block_open = True
                         yield _sse(
-                            "content_block_start",
+                            "content_block_delta",
                             {
-                                "type": "content_block_start",
+                                "type": "content_block_delta",
                                 "index": block_index,
-                                "content_block": {"type": "text", "text": ""},
+                                "delta": {"type": "text_delta", "text": text},
                             },
                         )
-                        text_block_open = True
-                    yield _sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {"type": "text_delta", "text": text},
-                        },
-                    )
 
                 tcs = delta.get("tool_calls")
                 if tcs:
@@ -985,6 +988,29 @@ async def _stream_with_web_search(openai_body: dict, request: MessagesRequest):
             tcs_to_emit = None  # internal-only iteration
 
         if tcs_to_emit is not None:
+            # Final / mixed iteration. If we were buffering (i.e. we entered
+            # the WebSearch loop earlier), flush the accumulated text now.
+            if not streaming_text and accumulated_text_parts:
+                buffered_text = "".join(accumulated_text_parts)
+                if not text_block_open:
+                    yield _sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {"type": "text", "text": ""},
+                        },
+                    )
+                    text_block_open = True
+                yield _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "text_delta", "text": buffered_text},
+                    },
+                )
+
             if text_block_open:
                 yield _sse(
                     "content_block_stop",
@@ -1030,6 +1056,11 @@ async def _stream_with_web_search(openai_body: dict, request: MessagesRequest):
                 "tool_call_id": tc.get("id"),
                 "content": result_text,
             })
+
+        # Subsequent iterations should buffer text instead of streaming it,
+        # so repeated preambles from a model that keeps re-issuing WebSearch
+        # don't get shown to the user multiple times.
+        streaming_text = False
 
     if not completed and config.VERBOSE:
         print("[web_search] WEB_SEARCH_MAX_ITERATIONS exceeded; closing stream.")
