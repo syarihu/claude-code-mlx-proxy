@@ -47,5 +47,14 @@ class Config:
     # the proxy sends requests that the backend can resolve correctly.
     MODEL_NAME: str = os.getenv("MODEL_NAME", "")
 
+    # Web search via Tavily — when set, the proxy intercepts the WebSearch
+    # tool call from the local LLM, executes a real search through the Tavily
+    # API, and feeds the results back to the model in an internal loop.
+    # Without a key, WebSearch calls fall through unchanged (which typically
+    # yields empty results because local backends cannot search the web).
+    TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "")
+    WEB_SEARCH_MAX_RESULTS: int = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
+    WEB_SEARCH_MAX_ITERATIONS: int = int(os.getenv("WEB_SEARCH_MAX_ITERATIONS", "5"))
+
 
 config = Config()

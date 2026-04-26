@@ -657,6 +657,247 @@ async def _stream_response(
 
 
 # ---------------------------------------------------------------------------
+# Web search (Tavily) interception
+# ---------------------------------------------------------------------------
+
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+WEB_SEARCH_TOOL_NAME = "WebSearch"
+
+
+def _has_web_search_tool(tools: Optional[List[Tool]]) -> bool:
+    if not tools:
+        return False
+    return any(t.name == WEB_SEARCH_TOOL_NAME for t in tools)
+
+
+def _format_tavily_results(data: dict) -> str:
+    parts: List[str] = []
+    answer = data.get("answer")
+    if answer:
+        parts.append(f"Answer: {answer}")
+    results = data.get("results") or []
+    for i, r in enumerate(results, 1):
+        title = r.get("title") or "Untitled"
+        url = r.get("url") or ""
+        content = (r.get("content") or "").strip()
+        parts.append(f"[{i}] {title}\nURL: {url}\n{content}")
+    return "\n\n".join(parts) if parts else "No results found."
+
+
+async def _tavily_search(
+    query: str,
+    max_results: int,
+    include_domains: Optional[List[str]] = None,
+    exclude_domains: Optional[List[str]] = None,
+) -> str:
+    if not config.TAVILY_API_KEY:
+        return "Web search is not configured on the proxy (TAVILY_API_KEY missing)."
+    if not query or not query.strip():
+        return "Web search query was empty."
+
+    body: Dict[str, Any] = {
+        "query": query,
+        "max_results": max_results,
+        "include_answer": True,
+    }
+    if include_domains:
+        body["include_domains"] = include_domains
+    if exclude_domains:
+        body["exclude_domains"] = exclude_domains
+
+    headers = {
+        "Authorization": f"Bearer {config.TAVILY_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(TAVILY_SEARCH_URL, json=body, headers=headers)
+        if resp.status_code != 200:
+            return f"Web search failed: HTTP {resp.status_code} {resp.text[:200]}"
+        return _format_tavily_results(resp.json())
+    except Exception as e:
+        return f"Web search error: {e}"
+
+
+async def _run_web_search_loop(openai_body: dict) -> dict:
+    """Iteratively resolve WebSearch tool calls inside the proxy.
+
+    The model is invoked non-streaming; whenever every tool call in the
+    response is WebSearch, the proxy executes them via Tavily and feeds the
+    results back into the conversation. The loop returns the first response
+    that contains no WebSearch tool calls (or contains a mix of WebSearch
+    with other tool calls — those are forwarded to the client untouched so
+    Claude Code can execute the non-WebSearch ones).
+    """
+    current_body = dict(openai_body)
+    current_body["stream"] = False
+    current_body.pop("stream_options", None)
+    current_body["messages"] = list(openai_body.get("messages") or [])
+
+    for _ in range(max(1, config.WEB_SEARCH_MAX_ITERATIONS)):
+        resp = await http_client.post("chat/completions", json=current_body)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        data = resp.json()
+
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message", {}) or {}
+        tool_calls = message.get("tool_calls") or []
+
+        web_search_calls = [
+            tc for tc in tool_calls
+            if (tc.get("function") or {}).get("name") == WEB_SEARCH_TOOL_NAME
+        ]
+        if not web_search_calls:
+            return data
+
+        other_calls = [tc for tc in tool_calls if tc not in web_search_calls]
+        if other_calls:
+            # Mixed tool calls: bail out and let the client handle the rest.
+            # (WebSearch results would otherwise be lost without a way to
+            # re-inject them alongside the non-WebSearch tool calls.)
+            return data
+
+        # All tool calls are WebSearch — execute them and continue the loop.
+        assistant_msg: Dict[str, Any] = {"role": "assistant", "tool_calls": tool_calls}
+        if message.get("content"):
+            assistant_msg["content"] = message["content"]
+        current_body["messages"].append(assistant_msg)
+
+        for tc in web_search_calls:
+            fn = tc.get("function") or {}
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            result_text = await _tavily_search(
+                query=args.get("query", ""),
+                max_results=config.WEB_SEARCH_MAX_RESULTS,
+                include_domains=args.get("allowed_domains"),
+                exclude_domains=args.get("blocked_domains"),
+            )
+            if config.VERBOSE:
+                print(
+                    f"[web_search] query={args.get('query', '')!r} "
+                    f"chars={len(result_text)}"
+                )
+            current_body["messages"].append({
+                "role": "tool",
+                "tool_call_id": tc.get("id"),
+                "content": result_text,
+            })
+
+    raise HTTPException(
+        status_code=500,
+        detail="WebSearch loop exceeded WEB_SEARCH_MAX_ITERATIONS.",
+    )
+
+
+async def _emit_response_as_stream(data: dict, request: MessagesRequest):
+    """Convert a non-streaming OpenAI response into Anthropic SSE events."""
+    msg_id = _make_msg_id()
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message", {}) or {}
+    finish_reason = choice.get("finish_reason")
+    usage = data.get("usage", {}) or {}
+
+    yield _sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": request.model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        },
+    )
+
+    block_index = 0
+    text = message.get("content")
+    if text:
+        yield _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+        yield _sse(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {"type": "text_delta", "text": text},
+            },
+        )
+        yield _sse(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": block_index},
+        )
+        block_index += 1
+
+    for tc in message.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        try:
+            arguments = json.loads(fn.get("arguments") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            arguments = {}
+        yield _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tc.get("id") or _make_tool_use_id(),
+                    "name": fn.get("name", "unknown"),
+                    "input": {},
+                },
+            },
+        )
+        yield _sse(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": json.dumps(arguments),
+                },
+            },
+        )
+        yield _sse(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": block_index},
+        )
+        block_index += 1
+
+    yield _sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": _map_finish_reason(finish_reason),
+                "stop_sequence": None,
+            },
+            "usage": {
+                "input_tokens": usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0),
+            },
+        },
+    )
+    yield _sse("message_stop", {"type": "message_stop"})
+
+
+# ---------------------------------------------------------------------------
 # API endpoints
 # ---------------------------------------------------------------------------
 
@@ -668,16 +909,30 @@ async def create_message(request: MessagesRequest):
 
     openai_body = await _build_openai_request(request)
     n_tools = len(request.tools) if request.tools else 0
+    use_web_search_loop = bool(
+        config.TAVILY_API_KEY and _has_web_search_tool(request.tools)
+    )
 
     if config.VERBOSE:
         print(
             f"[/v1/messages] tools={n_tools}, tool_mode={config.TOOL_MODE}, "
-            f"stream={request.stream}"
+            f"stream={request.stream}, web_search_loop={use_web_search_loop}"
         )
         if openai_body.get("tools"):
             print("[tools] " + json.dumps(openai_body["tools"], ensure_ascii=False, indent=2))
 
     try:
+        if use_web_search_loop:
+            data = await _run_web_search_loop(openai_body)
+            if request.stream:
+                async def ws_stream():
+                    async for chunk in _emit_response_as_stream(data, request):
+                        yield chunk
+                return StreamingResponse(
+                    ws_stream(), media_type="text/event-stream"
+                )
+            return _convert_response(data, request)
+
         if request.stream:
             req = http_client.build_request(
                 "POST", "chat/completions", json=openai_body

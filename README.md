@@ -187,6 +187,19 @@ All server settings are managed through the `.env` file.
 | `API_MODEL_NAME` | `claude-4-sonnet-20250514`     | The model name that the API will report. Set this to a known Claude model to ensure client compatibility.                              |
 | `TOOL_MODE`      | `slim`                         | Tool definition handling: `full` (keep all schemas), `slim` (name + description + required params only), `none` (omit tools entirely). |
 | `VERBOSE`        | `false`                        | Enable verbose debug logging.                                                                                                         |
+| `TAVILY_API_KEY` | _(unset)_                      | When set, the proxy intercepts Claude Code's `WebSearch` tool calls and runs them through the [Tavily Search API](https://tavily.com) (free tier: 1,000 searches/month, no credit card). Without a key, `WebSearch` falls through and typically returns no results because local backends cannot search the web. |
+| `WEB_SEARCH_MAX_RESULTS` | `5`                    | Max results returned per Tavily search.                                                                                              |
+| `WEB_SEARCH_MAX_ITERATIONS` | `5`                 | Safety limit on consecutive `WebSearch` calls inside a single proxy request.                                                          |
+
+### Enabling web search (optional)
+
+Local LLMs cannot perform real web searches on their own, so Claude Code's `WebSearch` tool returns empty results when pointed at a local backend. To make `WebSearch` work end-to-end:
+
+1. Sign up at [tavily.com](https://tavily.com) and grab your API key (free tier gives 1,000 searches/month, no credit card required).
+2. Add `TAVILY_API_KEY=tvly-...` to your `.env`.
+3. Restart the proxy.
+
+When `TAVILY_API_KEY` is set and Claude Code includes `WebSearch` in its tool list, the proxy intercepts the tool call internally, runs the query through Tavily, and feeds the results back to the local model — Claude Code only sees the model's final synthesized response.
 
 ## License
 
