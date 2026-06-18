@@ -39,6 +39,17 @@ class ContentBlockToolResult(BaseModel):
     content: Union[str, List[Dict[str, Any]], Dict[str, Any], List[Any], Any]
 
 
+class ContentBlockThinking(BaseModel):
+    type: Literal["thinking"] = "thinking"
+    thinking: str = ""
+    signature: Optional[str] = None
+
+
+class ContentBlockRedactedThinking(BaseModel):
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str = ""
+
+
 class SystemContent(BaseModel):
     type: Literal["text"] = "text"
     text: str
@@ -65,6 +76,8 @@ class Message(BaseModel):
                 ContentBlockImage,
                 ContentBlockToolUse,
                 ContentBlockToolResult,
+                ContentBlockThinking,
+                ContentBlockRedactedThinking,
             ]
         ],
     ]
