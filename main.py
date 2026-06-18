@@ -1,13 +1,13 @@
 import json
 import uuid
-from typing import List, Dict, Any, Optional, Union, Literal
+from typing import List, Dict, Any, Optional, Union, Literal, Annotated
 from contextlib import asynccontextmanager
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from config import config
 
 
@@ -66,21 +66,28 @@ class Tool(BaseModel):
     input_schema: Dict[str, Any]
 
 
+# Known Anthropic content blocks, with a permissive dict fallback so
+# unrecognized / future block types don't fail request validation. The
+# OpenAI conversion only acts on known `type`s and silently drops the rest.
+# `left_to_right` ensures specific models are matched before the catch-all dict
+# (smart mode could otherwise classify every block as the generic dict).
+ContentBlock = Annotated[
+    Union[
+        ContentBlockText,
+        ContentBlockImage,
+        ContentBlockToolUse,
+        ContentBlockToolResult,
+        ContentBlockThinking,
+        ContentBlockRedactedThinking,
+        Dict[str, Any],
+    ],
+    Field(union_mode="left_to_right"),
+]
+
+
 class Message(BaseModel):
     role: Literal["user", "assistant", "system"]
-    content: Union[
-        str,
-        List[
-            Union[
-                ContentBlockText,
-                ContentBlockImage,
-                ContentBlockToolUse,
-                ContentBlockToolResult,
-                ContentBlockThinking,
-                ContentBlockRedactedThinking,
-            ]
-        ],
-    ]
+    content: Union[str, List[ContentBlock]]
 
 
 class MessagesRequest(BaseModel):
