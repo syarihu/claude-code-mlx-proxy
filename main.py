@@ -56,7 +56,7 @@ class Tool(BaseModel):
 
 
 class Message(BaseModel):
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: Union[
         str,
         List[
@@ -345,6 +345,18 @@ def _anthropic_messages_to_openai(
             if not text and not tc_list:
                 entry["content"] = ""
             result.append(entry)
+
+        elif msg.role == "system":
+            # Claude Code may place system content (e.g. system-reminders) as a
+            # message inside the array, not just the top-level `system` field.
+            # Preserve it as an OpenAI system message at its original position.
+            text_parts = [
+                block.text
+                for block in msg.content
+                if getattr(block, "type", None) == "text"
+            ]
+            if text_parts:
+                result.append({"role": "system", "content": "\n".join(text_parts)})
 
         elif msg.role == "user":
             text_parts: List[str] = []
