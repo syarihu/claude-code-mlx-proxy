@@ -7,7 +7,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from config import config
 
 
@@ -66,11 +66,40 @@ class Tool(BaseModel):
     input_schema: Dict[str, Any]
 
 
-# Known Anthropic content blocks, with a permissive dict fallback so
-# unrecognized / future block types don't fail request validation. The
-# OpenAI conversion only acts on known `type`s and silently drops the rest.
-# `left_to_right` ensures specific models are matched before the catch-all dict
-# (smart mode could otherwise classify every block as the generic dict).
+_KNOWN_CONTENT_BLOCK_TYPES = {
+    "text",
+    "image",
+    "tool_use",
+    "tool_result",
+    "thinking",
+    "redacted_thinking",
+}
+
+
+class ContentBlockUnknown(BaseModel):
+    """Catch-all for unrecognized / future block types so they don't 422.
+
+    Rejects the known `type` values, so a *malformed* known block (e.g.
+    `{"type": "tool_use"}` missing `id`/`name`/`input`) still fails loudly
+    instead of matching this permissive model and being silently dropped.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    type: str
+
+    @field_validator("type")
+    @classmethod
+    def _reject_known_types(cls, v: str) -> str:
+        if v in _KNOWN_CONTENT_BLOCK_TYPES:
+            raise ValueError(f"'{v}' must validate against its specific block model")
+        return v
+
+
+# Known Anthropic content blocks, plus a catch-all for unrecognized / future
+# block types so they don't fail request validation. The OpenAI conversion only
+# acts on known `type`s and drops the rest. `left_to_right` ensures specific
+# models are matched before the catch-all (smart mode could otherwise classify
+# every block as the permissive model).
 ContentBlock = Annotated[
     Union[
         ContentBlockText,
@@ -79,7 +108,7 @@ ContentBlock = Annotated[
         ContentBlockToolResult,
         ContentBlockThinking,
         ContentBlockRedactedThinking,
-        Dict[str, Any],
+        ContentBlockUnknown,
     ],
     Field(union_mode="left_to_right"),
 ]
