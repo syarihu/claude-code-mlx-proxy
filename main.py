@@ -553,6 +553,9 @@ async def _stream_response(
 
     block_index = 0
     text_block_open = False
+    tool_block_open = False
+    current_tool_index = None
+    current_tool_id = None
     finish_reason = None
     input_tokens = 0
     output_tokens = 0
@@ -576,6 +579,20 @@ async def _stream_response(
         if not text_block_open:
             return None
         text_block_open = False
+        msg = _sse(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": block_index},
+        )
+        block_index += 1
+        return msg
+
+    def _close_tool_block():
+        nonlocal block_index, tool_block_open, current_tool_index, current_tool_id
+        if not tool_block_open:
+            return None
+        tool_block_open = False
+        current_tool_index = None
+        current_tool_id = None
         msg = _sse(
             "content_block_stop",
             {"type": "content_block_stop", "index": block_index},
@@ -615,6 +632,9 @@ async def _stream_response(
         # Text content
         text = delta.get("content")
         if text:
+            msg = _close_tool_block()
+            if msg:
+                yield msg
             msg = _open_text_block()
             if msg:
                 yield msg
@@ -627,50 +647,65 @@ async def _stream_response(
                 },
             )
 
-        # Tool calls (sent as complete objects by mlx-lm)
+        # Tool calls. OpenAI / llama.cpp stream a single call across many chunks
+        # (id + name in the first, argument fragments after, grouped by `index`);
+        # mlx-lm tends to send one complete object. Accumulate per index/id and
+        # forward argument fragments as raw `input_json_delta`. Re-parsing a
+        # fragment (the old behavior) turned one call into many bogus tool_use
+        # blocks, wrecking the client's rendering.
         tool_calls = delta.get("tool_calls")
         if tool_calls:
             msg = _close_text_block()
             if msg:
                 yield msg
             for tc in tool_calls:
-                fn = tc.get("function", {})
-                try:
-                    arguments = json.loads(fn.get("arguments", "{}"))
-                except (json.JSONDecodeError, TypeError):
-                    arguments = {}
-                yield _sse(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": tc.get("id") or _make_tool_use_id(),
-                            "name": fn.get("name", "unknown"),
-                            "input": {},
+                fn = tc.get("function", {}) or {}
+                oai_idx = tc.get("index", 0)
+                tc_id = tc.get("id")
+                is_new = (
+                    not tool_block_open
+                    or oai_idx != current_tool_index
+                    or (tc_id is not None and tc_id != current_tool_id)
+                )
+                if is_new:
+                    msg = _close_tool_block()
+                    if msg:
+                        yield msg
+                    tool_block_open = True
+                    current_tool_index = oai_idx
+                    current_tool_id = tc_id or _make_tool_use_id()
+                    yield _sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": current_tool_id,
+                                "name": fn.get("name") or "tool",
+                                "input": {},
+                            },
                         },
-                    },
-                )
-                yield _sse(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": json.dumps(arguments),
+                    )
+                args_fragment = fn.get("arguments")
+                if args_fragment:
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": args_fragment,
+                            },
                         },
-                    },
-                )
-                yield _sse(
-                    "content_block_stop",
-                    {"type": "content_block_stop", "index": block_index},
-                )
-                block_index += 1
+                    )
 
-    # Close any remaining text block
+    # Close any remaining open block
     msg = _close_text_block()
+    if msg:
+        yield msg
+    msg = _close_tool_block()
     if msg:
         yield msg
 
