@@ -1,13 +1,13 @@
 import json
 import uuid
-from typing import List, Dict, Any, Optional, Union, Literal
+from typing import List, Dict, Any, Optional, Union, Literal, Annotated
 from contextlib import asynccontextmanager
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from config import config
 
 
@@ -39,6 +39,17 @@ class ContentBlockToolResult(BaseModel):
     content: Union[str, List[Dict[str, Any]], Dict[str, Any], List[Any], Any]
 
 
+class ContentBlockThinking(BaseModel):
+    type: Literal["thinking"] = "thinking"
+    thinking: str = ""
+    signature: Optional[str] = None
+
+
+class ContentBlockRedactedThinking(BaseModel):
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str = ""
+
+
 class SystemContent(BaseModel):
     type: Literal["text"] = "text"
     text: str
@@ -55,19 +66,57 @@ class Tool(BaseModel):
     input_schema: Dict[str, Any]
 
 
+_KNOWN_CONTENT_BLOCK_TYPES = {
+    "text",
+    "image",
+    "tool_use",
+    "tool_result",
+    "thinking",
+    "redacted_thinking",
+}
+
+
+class ContentBlockUnknown(BaseModel):
+    """Catch-all for unrecognized / future block types so they don't 422.
+
+    Rejects the known `type` values, so a *malformed* known block (e.g.
+    `{"type": "tool_use"}` missing `id`/`name`/`input`) still fails loudly
+    instead of matching this permissive model and being silently dropped.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    type: str
+
+    @field_validator("type")
+    @classmethod
+    def _reject_known_types(cls, v: str) -> str:
+        if v in _KNOWN_CONTENT_BLOCK_TYPES:
+            raise ValueError(f"'{v}' must validate against its specific block model")
+        return v
+
+
+# Known Anthropic content blocks, plus a catch-all for unrecognized / future
+# block types so they don't fail request validation. The OpenAI conversion only
+# acts on known `type`s and drops the rest. `left_to_right` ensures specific
+# models are matched before the catch-all (smart mode could otherwise classify
+# every block as the permissive model).
+ContentBlock = Annotated[
+    Union[
+        ContentBlockText,
+        ContentBlockImage,
+        ContentBlockToolUse,
+        ContentBlockToolResult,
+        ContentBlockThinking,
+        ContentBlockRedactedThinking,
+        ContentBlockUnknown,
+    ],
+    Field(union_mode="left_to_right"),
+]
+
+
 class Message(BaseModel):
-    role: Literal["user", "assistant"]
-    content: Union[
-        str,
-        List[
-            Union[
-                ContentBlockText,
-                ContentBlockImage,
-                ContentBlockToolUse,
-                ContentBlockToolResult,
-            ]
-        ],
-    ]
+    role: Literal["user", "assistant", "system"]
+    content: Union[str, List[ContentBlock]]
 
 
 class MessagesRequest(BaseModel):
@@ -346,6 +395,18 @@ def _anthropic_messages_to_openai(
                 entry["content"] = ""
             result.append(entry)
 
+        elif msg.role == "system":
+            # Claude Code may place system content (e.g. system-reminders) as a
+            # message inside the array, not just the top-level `system` field.
+            # Preserve it as an OpenAI system message at its original position.
+            text_parts = [
+                block.text
+                for block in msg.content
+                if getattr(block, "type", None) == "text"
+            ]
+            if text_parts:
+                result.append({"role": "system", "content": "\n".join(text_parts)})
+
         elif msg.role == "user":
             text_parts: List[str] = []
 
@@ -521,6 +582,10 @@ async def _stream_response(
 
     block_index = 0
     text_block_open = False
+    # Buffer tool calls by OpenAI `index` (insertion-ordered) and flush them as
+    # complete, sequential Anthropic blocks. Streaming blocks inline broke with
+    # parallel / interleaved tool-call deltas (one call split across blocks).
+    tool_calls_acc: Dict[int, Dict[str, Any]] = {}
     finish_reason = None
     input_tokens = 0
     output_tokens = 0
@@ -550,6 +615,54 @@ async def _stream_response(
         )
         block_index += 1
         return msg
+
+    def _flush_tool_calls():
+        # Emit every buffered tool call as a complete, sequential tool_use block
+        # (start → one input_json_delta with the full arguments → stop), in
+        # index order. Returns the SSE strings for the caller to yield.
+        nonlocal block_index, tool_calls_acc
+        msgs = []
+        for idx in sorted(tool_calls_acc):
+            tc = tool_calls_acc[idx]
+            msgs.append(
+                _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tc["id"] or _make_tool_use_id(),
+                            # A missing name means a malformed call; surface it
+                            # explicitly rather than inventing a plausible one.
+                            "name": tc["name"] or "unknown",
+                            "input": {},
+                        },
+                    },
+                )
+            )
+            msgs.append(
+                _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": tc["args"] or "{}",
+                        },
+                    },
+                )
+            )
+            msgs.append(
+                _sse(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": block_index},
+                )
+            )
+            block_index += 1
+        tool_calls_acc = {}
+        return msgs
 
     async for line in response.aiter_lines():
         if not line.startswith("data: "):
@@ -583,6 +696,8 @@ async def _stream_response(
         # Text content
         text = delta.get("content")
         if text:
+            for m in _flush_tool_calls():
+                yield m
             msg = _open_text_block()
             if msg:
                 yield msg
@@ -595,52 +710,40 @@ async def _stream_response(
                 },
             )
 
-        # Tool calls (sent as complete objects by mlx-lm)
+        # Tool calls. OpenAI / llama.cpp stream a call across many chunks (id +
+        # name first, argument fragments after, grouped by `index`) and may
+        # interleave deltas for parallel calls. Accumulate per index; id/name
+        # are captured whenever they appear and argument fragments concatenated.
+        # The blocks are emitted later (on text resume or at stream end), so
+        # interleaving can't split one call into multiple blocks.
         tool_calls = delta.get("tool_calls")
         if tool_calls:
             msg = _close_text_block()
             if msg:
                 yield msg
-            for tc in tool_calls:
-                fn = tc.get("function", {})
-                try:
-                    arguments = json.loads(fn.get("arguments", "{}"))
-                except (json.JSONDecodeError, TypeError):
-                    arguments = {}
-                yield _sse(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": tc.get("id") or _make_tool_use_id(),
-                            "name": fn.get("name", "unknown"),
-                            "input": {},
-                        },
-                    },
-                )
-                yield _sse(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": json.dumps(arguments),
-                        },
-                    },
-                )
-                yield _sse(
-                    "content_block_stop",
-                    {"type": "content_block_stop", "index": block_index},
-                )
-                block_index += 1
+            for pos, tc in enumerate(tool_calls):
+                fn = tc.get("function", {}) or {}
+                # Fall back to the list position when `index` is absent — a flat
+                # default of 0 would merge distinct calls and corrupt id/args.
+                idx = tc.get("index")
+                oai_idx = idx if idx is not None else pos
+                entry = tool_calls_acc.get(oai_idx)
+                if entry is None:
+                    entry = {"id": None, "name": None, "args": ""}
+                    tool_calls_acc[oai_idx] = entry
+                if tc.get("id"):
+                    entry["id"] = tc["id"]
+                if fn.get("name"):
+                    entry["name"] = fn["name"]
+                if fn.get("arguments"):
+                    entry["args"] += fn["arguments"]
 
-    # Close any remaining text block
+    # Close any remaining open block and flush buffered tool calls
     msg = _close_text_block()
     if msg:
         yield msg
+    for m in _flush_tool_calls():
+        yield m
 
     yield _sse(
         "message_delta",
