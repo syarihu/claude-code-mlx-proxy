@@ -582,9 +582,10 @@ async def _stream_response(
 
     block_index = 0
     text_block_open = False
-    tool_block_open = False
-    current_tool_index = None
-    current_tool_id = None
+    # Buffer tool calls by OpenAI `index` (insertion-ordered) and flush them as
+    # complete, sequential Anthropic blocks. Streaming blocks inline broke with
+    # parallel / interleaved tool-call deltas (one call split across blocks).
+    tool_calls_acc: Dict[int, Dict[str, Any]] = {}
     finish_reason = None
     input_tokens = 0
     output_tokens = 0
@@ -615,19 +616,51 @@ async def _stream_response(
         block_index += 1
         return msg
 
-    def _close_tool_block():
-        nonlocal block_index, tool_block_open, current_tool_index, current_tool_id
-        if not tool_block_open:
-            return None
-        tool_block_open = False
-        current_tool_index = None
-        current_tool_id = None
-        msg = _sse(
-            "content_block_stop",
-            {"type": "content_block_stop", "index": block_index},
-        )
-        block_index += 1
-        return msg
+    def _flush_tool_calls():
+        # Emit every buffered tool call as a complete, sequential tool_use block
+        # (start → one input_json_delta with the full arguments → stop), in
+        # index order. Returns the SSE strings for the caller to yield.
+        nonlocal block_index, tool_calls_acc
+        msgs = []
+        for idx in sorted(tool_calls_acc):
+            tc = tool_calls_acc[idx]
+            msgs.append(
+                _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tc["id"] or _make_tool_use_id(),
+                            "name": tc["name"] or "tool",
+                            "input": {},
+                        },
+                    },
+                )
+            )
+            msgs.append(
+                _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": tc["args"] or "{}",
+                        },
+                    },
+                )
+            )
+            msgs.append(
+                _sse(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": block_index},
+                )
+            )
+            block_index += 1
+        tool_calls_acc = {}
+        return msgs
 
     async for line in response.aiter_lines():
         if not line.startswith("data: "):
@@ -661,9 +694,8 @@ async def _stream_response(
         # Text content
         text = delta.get("content")
         if text:
-            msg = _close_tool_block()
-            if msg:
-                yield msg
+            for m in _flush_tool_calls():
+                yield m
             msg = _open_text_block()
             if msg:
                 yield msg
@@ -676,12 +708,12 @@ async def _stream_response(
                 },
             )
 
-        # Tool calls. OpenAI / llama.cpp stream a single call across many chunks
-        # (id + name in the first, argument fragments after, grouped by `index`);
-        # mlx-lm tends to send one complete object. Accumulate per index/id and
-        # forward argument fragments as raw `input_json_delta`. Re-parsing a
-        # fragment (the old behavior) turned one call into many bogus tool_use
-        # blocks, wrecking the client's rendering.
+        # Tool calls. OpenAI / llama.cpp stream a call across many chunks (id +
+        # name first, argument fragments after, grouped by `index`) and may
+        # interleave deltas for parallel calls. Accumulate per index; id/name
+        # are captured whenever they appear and argument fragments concatenated.
+        # The blocks are emitted later (on text resume or at stream end), so
+        # interleaving can't split one call into multiple blocks.
         tool_calls = delta.get("tool_calls")
         if tool_calls:
             msg = _close_text_block()
@@ -690,53 +722,23 @@ async def _stream_response(
             for tc in tool_calls:
                 fn = tc.get("function", {}) or {}
                 oai_idx = tc.get("index", 0)
-                tc_id = tc.get("id")
-                is_new = (
-                    not tool_block_open
-                    or oai_idx != current_tool_index
-                    or (tc_id is not None and tc_id != current_tool_id)
-                )
-                if is_new:
-                    msg = _close_tool_block()
-                    if msg:
-                        yield msg
-                    tool_block_open = True
-                    current_tool_index = oai_idx
-                    current_tool_id = tc_id or _make_tool_use_id()
-                    yield _sse(
-                        "content_block_start",
-                        {
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": current_tool_id,
-                                "name": fn.get("name") or "tool",
-                                "input": {},
-                            },
-                        },
-                    )
-                args_fragment = fn.get("arguments")
-                if args_fragment:
-                    yield _sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": args_fragment,
-                            },
-                        },
-                    )
+                entry = tool_calls_acc.get(oai_idx)
+                if entry is None:
+                    entry = {"id": None, "name": None, "args": ""}
+                    tool_calls_acc[oai_idx] = entry
+                if tc.get("id"):
+                    entry["id"] = tc["id"]
+                if fn.get("name"):
+                    entry["name"] = fn["name"]
+                if fn.get("arguments"):
+                    entry["args"] += fn["arguments"]
 
-    # Close any remaining open block
+    # Close any remaining open block and flush buffered tool calls
     msg = _close_text_block()
     if msg:
         yield msg
-    msg = _close_tool_block()
-    if msg:
-        yield msg
+    for m in _flush_tool_calls():
+        yield m
 
     yield _sse(
         "message_delta",
