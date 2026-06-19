@@ -719,9 +719,12 @@ async def _stream_response(
             msg = _close_text_block()
             if msg:
                 yield msg
-            for tc in tool_calls:
+            for pos, tc in enumerate(tool_calls):
                 fn = tc.get("function", {}) or {}
-                oai_idx = tc.get("index", 0)
+                # Fall back to the list position when `index` is absent — a flat
+                # default of 0 would merge distinct calls and corrupt id/args.
+                idx = tc.get("index")
+                oai_idx = idx if idx is not None else pos
                 entry = tool_calls_acc.get(oai_idx)
                 if entry is None:
                     entry = {"id": None, "name": None, "args": ""}
