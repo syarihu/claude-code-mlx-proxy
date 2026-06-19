@@ -633,7 +633,9 @@ async def _stream_response(
                         "content_block": {
                             "type": "tool_use",
                             "id": tc["id"] or _make_tool_use_id(),
-                            "name": tc["name"] or "tool",
+                            # A missing name means a malformed call; surface it
+                            # explicitly rather than inventing a plausible one.
+                            "name": tc["name"] or "unknown",
                             "input": {},
                         },
                     },
