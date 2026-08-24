@@ -343,7 +343,8 @@ def _tool_result_to_str(content) -> str:
 
 
 def _format_system_reminder(text: str) -> str:
-    if "<system-reminder>" in text:
+    stripped = text.strip()
+    if stripped.startswith("<system-reminder>") and stripped.endswith("</system-reminder>"):
         return text
     return f"<system-reminder>\n{text}\n</system-reminder>"
 
@@ -887,8 +888,7 @@ async def health_check():
     return {"status": "healthy" if backend_ok else "degraded", "backend": backend_ok}
 
 
-@app.head("/api/hello")
-@app.get("/api/hello")
+@app.api_route("/api/hello", methods=["GET", "HEAD"])
 async def api_hello():
     return {"status": "ok"}
 
