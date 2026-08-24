@@ -342,6 +342,13 @@ def _tool_result_to_str(content) -> str:
     return str(content) if content else ""
 
 
+def _format_system_reminder(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("<system-reminder>") and stripped.endswith("</system-reminder>"):
+        return text
+    return f"<system-reminder>\n{text}\n</system-reminder>"
+
+
 def _anthropic_messages_to_openai(
     messages: List[Message],
     system: Optional[Union[str, List[SystemContent]]] = None,
@@ -360,7 +367,18 @@ def _anthropic_messages_to_openai(
 
     for msg in messages:
         if isinstance(msg.content, str):
-            result.append({"role": msg.role, "content": msg.content})
+            if msg.role == "system":
+                if not result:
+                    result.append({"role": "system", "content": msg.content})
+                else:
+                    result.append(
+                        {
+                            "role": "user",
+                            "content": _format_system_reminder(msg.content),
+                        }
+                    )
+            else:
+                result.append({"role": msg.role, "content": msg.content})
             continue
 
         if msg.role == "assistant":
@@ -398,14 +416,25 @@ def _anthropic_messages_to_openai(
         elif msg.role == "system":
             # Claude Code may place system content (e.g. system-reminders) as a
             # message inside the array, not just the top-level `system` field.
-            # Preserve it as an OpenAI system message at its original position.
+            # Convert non-first system messages to user messages to avoid Jinja
+            # template errors on models/backends (e.g. Qwen in llama.cpp) that
+            # enforce system messages must only be at the beginning.
             text_parts = [
                 block.text
                 for block in msg.content
                 if getattr(block, "type", None) == "text"
             ]
             if text_parts:
-                result.append({"role": "system", "content": "\n".join(text_parts)})
+                sys_msg_text = "\n".join(text_parts)
+                if not result:
+                    result.append({"role": "system", "content": sys_msg_text})
+                else:
+                    result.append(
+                        {
+                            "role": "user",
+                            "content": _format_system_reminder(sys_msg_text),
+                        }
+                    )
 
         elif msg.role == "user":
             text_parts: List[str] = []
@@ -857,6 +886,11 @@ async def health_check():
         except Exception:
             pass
     return {"status": "healthy" if backend_ok else "degraded", "backend": backend_ok}
+
+
+@app.api_route("/api/hello", methods=["GET", "HEAD"])
+async def api_hello():
+    return {"status": "ok"}
 
 
 @app.get("/")
